@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+backend/models/
+backend/static/
+backend/tmp_*
+.env

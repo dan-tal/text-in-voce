@@ -1,0 +1,15 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - audio_data:/app/static/audio
+      - model_data:/app/models
+    restart: unless-stopped
+
+volumes:
+  audio_data:
+  model_data:

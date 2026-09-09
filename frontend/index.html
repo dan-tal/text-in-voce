@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Text în voce</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Text în voce</h1>
+    <p class="subtitle">Încarcă un fișier .docx, .pdf sau .txt și ascultă-l citit cu voce română.</p>
+  </header>
+
+  <main>
+    <section id="upload-section" class="card">
+      <form id="upload-form">
+        <input type="file" id="file-input" accept=".docx,.pdf,.txt" required>
+        <button type="submit" id="upload-btn">Încarcă și generează audio</button>
+      </form>
+      <p id="status" class="status"></p>
+    </section>
+
+    <section id="player-section" class="card" hidden>
+      <div class="controls">
+        <button id="play-btn" title="Play">▶</button>
+        <button id="pause-btn" title="Pause" disabled>⏸</button>
+        <button id="stop-btn" title="Stop" disabled>⏹</button>
+        <label class="speed-control">
+          Viteză: <span id="speed-value">1.0x</span>
+          <input type="range" id="speed-slider" min="0.5" max="3" step="0.1" value="1">
+        </label>
+        <button type="button" id="share-btn" class="secondary-btn">🔗 Partajează link</button>
+        <a id="download-link" class="download-link" download="text-in-voce.mp3" hidden>⬇ Descarcă MP3</a>
+      </div>
+      <p class="hint">Apasă pe orice propoziție sau cuvânt din text pentru a sări acolo cu redarea.</p>
+      <div id="text-container"></div>
+    </section>
+  </main>
+
+  <footer>Elaborat de Dan T</footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
