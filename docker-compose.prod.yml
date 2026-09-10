@@ -1,0 +1,23 @@
+services:
+  textinvoce:
+    image: dan4kl/text-in-voce:latest
+    restart: unless-stopped
+    volumes:
+      - textinvoce-audio:/app/static/audio
+      - textinvoce-models:/app/models
+    networks:
+      - proxy
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+      - "traefik.enable=true"
+      - "traefik.http.routers.textinvoce.rule=Host(`textinvoce.casatd.org`)"
+      - "traefik.http.routers.textinvoce.entrypoints=web"
+      - "traefik.http.services.textinvoce.loadbalancer.server.port=8000"
+
+volumes:
+  textinvoce-audio:
+  textinvoce-models:
+
+networks:
+  proxy:
+    external: true

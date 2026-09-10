@@ -57,6 +57,20 @@ Backend-ul servește și frontend-ul (fișiere statice), deci totul rulează
 într-un singur container/serviciu — un singur `docker compose up` pornește
 tot ce trebuie.
 
+## Deploy pe server
+
+`./deploy.sh [versiune]` construiește și împinge `dan4kl/text-in-voce:latest`
+pe Docker Hub (versiunea apare în footer, ca reper pentru build-ul rulat).
+
+Pe server, `docker-compose.prod.yml` trage imaginea (nu o construiește) și o
+expune prin Traefik la `textinvoce.casatd.org` (rețeaua externă `proxy`
+trebuie să existe deja pe server):
+
+```bash
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
+```
+
 ## Note
 
 - Rulează 100% local, fără cont cloud sau API key.

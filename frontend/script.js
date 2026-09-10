@@ -18,6 +18,11 @@ let playbackRate = 1.0;
 let currentSessionId = null;
 const audio = new Audio();
 
+const versionEl = document.getElementById("app-version");
+if (versionEl && window.APP_VERSION) {
+  versionEl.textContent = `v${window.APP_VERSION}`;
+}
+
 uploadForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const file = fileInput.files[0];
