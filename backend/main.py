@@ -1,16 +1,24 @@
+import asyncio
 import json
+import logging
+import os
 import re
+import shutil
 import subprocess
+import threading
 import uuid
 import urllib.request
 import wave
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import docx
+from docx.table import Table
 import pdfplumber
 from piper import PiperVoice
 
@@ -19,6 +27,13 @@ MODELS_DIR = BASE_DIR / "models"
 STATIC_DIR = BASE_DIR / "static"
 AUDIO_DIR = STATIC_DIR / "audio"
 FRONTEND_DIR = BASE_DIR / "frontend"
+if not FRONTEND_DIR.exists():
+    FRONTEND_DIR = BASE_DIR.parent / "frontend"
+
+PROCESSING_WORKERS = max(1, int(os.getenv("PROCESSING_WORKERS", "2")))
+MAX_PENDING_DOCUMENTS = max(PROCESSING_WORKERS, int(os.getenv("MAX_PENDING_DOCUMENTS", "8")))
+MAX_UPLOAD_BYTES = max(1, int(os.getenv("MAX_UPLOAD_MB", "20"))) * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 MODEL_PATH = MODELS_DIR / "ro_RO-mihai-medium.onnx"
 CONFIG_PATH = MODELS_DIR / "ro_RO-mihai-medium.onnx.json"
@@ -29,7 +44,21 @@ CONFIG_URL = MODEL_URL + ".json"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Text în voce")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # A dedicated pool keeps document work away from the HTTP event loop and
+    # from Starlette's shared pool (also used to serve existing audio files).
+    pool = ThreadPoolExecutor(max_workers=PROCESSING_WORKERS, thread_name_prefix="document")
+    app.state.processing_pool = pool
+    app.state.pending_documents = 0
+    try:
+        await asyncio.get_running_loop().run_in_executor(pool, get_voice)
+        yield
+    finally:
+        await asyncio.to_thread(pool.shutdown, wait=True)
+
+
+app = FastAPI(title="Text în voce", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,28 +66,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_voice = None
+_voices = threading.local()
+_model_lock = threading.Lock()
 
 
 def _download_if_missing() -> None:
-    if not MODEL_PATH.exists():
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-    if not CONFIG_PATH.exists():
-        urllib.request.urlretrieve(CONFIG_URL, CONFIG_PATH)
+    with _model_lock:
+        for url, path in ((MODEL_URL, MODEL_PATH), (CONFIG_URL, CONFIG_PATH)):
+            if not path.exists():
+                # Publish only complete downloads, even when two workers start.
+                partial = path.with_suffix(path.suffix + ".part")
+                try:
+                    urllib.request.urlretrieve(url, partial)
+                    partial.replace(path)
+                finally:
+                    partial.unlink(missing_ok=True)
 
 
 def get_voice() -> PiperVoice:
-    global _voice
-    if _voice is None:
+    # Reuse one independent inference session per worker.
+    if not hasattr(_voices, "voice"):
         _download_if_missing()
-        _voice = PiperVoice.load(str(MODEL_PATH), config_path=str(CONFIG_PATH))
-    return _voice
-
-
-@app.on_event("startup")
-def startup() -> None:
-    # Ensure the model is present (and loaded) before the first request.
-    get_voice()
+        _voices.voice = PiperVoice.load(str(MODEL_PATH), config_path=str(CONFIG_PATH))
+    return _voices.voice
 
 
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-ZĂÂÎȘȚ0-9\"„])")
@@ -177,7 +207,13 @@ def _extract_blocks_docx(content: bytes) -> list[dict]:
     try:
         document = docx.Document(str(tmp_path))
         blocks = []
-        for p in document.paragraphs:
+        for p in document.iter_inner_content():
+            if isinstance(p, Table):
+                for row in p.rows:
+                    cells_text = " | ".join(c.text.strip() for c in row.cells if c.text.strip())
+                    if cells_text:
+                        blocks.append({"type": "paragraph", "runs": [_run(cells_text)]})
+                continue
             text = p.text.strip()
             if not text:
                 continue
@@ -189,11 +225,6 @@ def _extract_blocks_docx(content: bytes) -> list[dict]:
                 blocks.append({"type": "heading", "level": level, "runs": runs})
             else:
                 blocks.append({"type": "paragraph", "runs": runs})
-        for table in document.tables:
-            for row in table.rows:
-                cells_text = " | ".join(c.text.strip() for c in row.cells if c.text.strip())
-                if cells_text:
-                    blocks.append({"type": "paragraph", "runs": [_run(cells_text)]})
         return blocks
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -239,7 +270,7 @@ def _pdf_word_run(w: dict, rects) -> dict:
     )
 
 
-def _extract_blocks_pdf(content: bytes) -> list[dict]:
+def _extract_blocks_pdf(content: bytes, metadata: dict | None = None) -> list[dict]:
     tmp_path = BASE_DIR / f"tmp_{uuid.uuid4().hex}.pdf"
     tmp_path.write_bytes(content)
     try:
@@ -248,6 +279,8 @@ def _extract_blocks_pdf(content: bytes) -> list[dict]:
         all_sizes = []
 
         with pdfplumber.open(str(tmp_path)) as pdf:
+            if metadata is not None:
+                metadata["page_count"] = len(pdf.pages)
             for page_no, page in enumerate(pdf.pages, start=1):
                 words = page.extract_words(extra_attrs=["size", "fontname"])
                 rects = _pdf_highlight_rects(page)
@@ -328,24 +361,66 @@ def _extract_blocks_pdf(content: bytes) -> list[dict]:
         tmp_path.unlink(missing_ok=True)
 
 
-def extract_blocks(filename: str, content: bytes) -> list[dict]:
+def extract_blocks(filename: str, content: bytes, metadata: dict | None = None) -> list[dict]:
     suffix = Path(filename).suffix.lower()
 
     if suffix == ".txt":
-        return _extract_blocks_txt(content.decode("utf-8", errors="ignore"))
+        return _extract_blocks_txt(content.decode("utf-8-sig", errors="ignore"))
     if suffix == ".docx":
         return _extract_blocks_docx(content)
     if suffix == ".pdf":
-        return _extract_blocks_pdf(content)
+        return _extract_blocks_pdf(content, metadata)
 
     raise HTTPException(400, f"Format neacceptat: {suffix}. Folosește .docx, .pdf sau .txt.")
 
 
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
-    content = await file.read()
-    raw_blocks = extract_blocks(file.filename or "", content)
-    is_pdf = Path(file.filename or "").suffix.lower() == ".pdf"
+    filename = file.filename or ""
+    if Path(filename).suffix.lower() not in {".txt", ".pdf", ".docx"}:
+        await file.close()
+        raise HTTPException(400, "Format neacceptat. Folosește .docx, .pdf sau .txt.")
+    if app.state.pending_documents >= MAX_PENDING_DOCUMENTS:
+        await file.close()
+        raise HTTPException(429, "Serverul procesează prea multe documente. Reîncearcă mai târziu.",
+                            headers={"Retry-After": "5"})
+
+    # Reserve before reading: concurrent uploads count toward the memory bound.
+    app.state.pending_documents += 1
+    submitted = False
+    try:
+        content = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f"Fișierul depășește limita de {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
+        future = asyncio.get_running_loop().run_in_executor(
+            app.state.processing_pool, process_document, filename, content
+        )
+        submitted = True
+
+        def completed(job):
+            app.state.pending_documents -= 1
+            # Retrieve errors even if the HTTP client has disconnected.
+            if not job.cancelled():
+                job.exception()
+
+        future.add_done_callback(completed)
+        # Client cancellation must not free a slot while its thread still runs.
+        return await asyncio.shield(future)
+    finally:
+        if not submitted:
+            app.state.pending_documents -= 1
+        await file.close()
+
+
+def process_document(filename: str, content: bytes) -> dict:
+    metadata = {}
+    try:
+        raw_blocks = extract_blocks(filename, content, metadata)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Could not extract document text", exc_info=True)
+        raise HTTPException(400, "Fișierul nu poate fi citit. Verifică formatul și integritatea lui.") from exc
     if not raw_blocks:
         raise HTTPException(400, "Nu s-a găsit text în fișier.")
 
@@ -354,10 +429,24 @@ async def upload(file: UploadFile = File(...)):
     session_dir = AUDIO_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
+    try:
+        return _synthesize_document(raw_blocks, voice, session_id, session_dir,
+                                    content if Path(filename).suffix.lower() == ".pdf" else None,
+                                    metadata.get("page_count"))
+    except Exception as exc:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        if isinstance(exc, HTTPException):
+            raise
+        logger.exception("Document synthesis failed")
+        raise HTTPException(500, "Generarea audio a eșuat. Reîncearcă mai târziu.") from exc
+
+
+def _synthesize_document(raw_blocks: list[dict], voice: PiperVoice,
+                         session_id: str, session_dir: Path, original_pdf: bytes | None = None,
+                         page_count: int | None = None) -> dict:
     sentences = []
     blocks = []
     global_index = 0
-
     for raw_block in raw_blocks:
         block_sentences = split_styled_sentences(raw_block["runs"])
         if not block_sentences:
@@ -389,6 +478,8 @@ async def upload(file: UploadFile = File(...)):
         block_out = {"type": raw_block["type"], "sentence_indices": indices}
         if raw_block.get("level"):
             block_out["level"] = raw_block["level"]
+        if raw_block.get("page"):
+            block_out["page"] = raw_block["page"]
         blocks.append(block_out)
 
     if not sentences:
@@ -397,8 +488,8 @@ async def upload(file: UploadFile = File(...)):
     mp3_url = _build_mp3(session_dir, len(sentences))
 
     original_url = None
-    if is_pdf:
-        (session_dir / "original.pdf").write_bytes(content)
+    if original_pdf is not None:
+        (session_dir / "original.pdf").write_bytes(original_pdf)
         original_url = f"/audio/{session_id}/original.pdf"
 
     result = {
@@ -407,6 +498,7 @@ async def upload(file: UploadFile = File(...)):
         "blocks": blocks,
         "mp3_url": mp3_url,
         "original_url": original_url,
+        "page_count": page_count,
     }
     (session_dir / "meta.json").write_text(json.dumps(result), encoding="utf-8")
     return result
@@ -416,8 +508,8 @@ SESSION_ID_RE = re.compile(r"^[0-9a-f]{6,32}$")
 
 
 @app.get("/api/session/{session_id}")
-async def get_session(session_id: str):
-    if not SESSION_ID_RE.match(session_id):
+def get_session(session_id: str):
+    if not SESSION_ID_RE.fullmatch(session_id):
         raise HTTPException(404, "Sesiune negăsită sau expirată.")
     meta_path = AUDIO_DIR / session_id / "meta.json"
     if not meta_path.exists():
@@ -435,15 +527,19 @@ def _build_mp3(session_dir: Path, sentence_count: int) -> str | None:
                 with wave.open(str(session_dir / f"{index}.wav"), "rb") as in_wav:
                     if index == 0:
                         out_wav.setparams(in_wav.getparams())
-                    out_wav.writeframes(in_wav.readframes(in_wav.getnframes()))
+                    while chunk := in_wav.readframes(65536):
+                        out_wav.writeframes(chunk)
 
         subprocess.run(
             ["ffmpeg", "-y", "-i", str(combined_path), "-codec:a", "libmp3lame", "-qscale:a", "2", str(mp3_path)],
             check=True,
+            timeout=300,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        logger.warning("MP3 export failed for %s", session_dir.name, exc_info=True)
+        mp3_path.unlink(missing_ok=True)
         return None
     finally:
         combined_path.unlink(missing_ok=True)

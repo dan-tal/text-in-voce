@@ -1,0 +1,6 @@
+{
+  "name": "text-in-voce-tests",
+  "private": true,
+  "scripts": { "test:frontend": "node --test tests/frontend.test.cjs" },
+  "devDependencies": { "playwright": "1.62.1" }
+}

@@ -1,1 +1,1 @@
-window.APP_VERSION = '20261007-0555-4e14804';
+window.APP_VERSION = '20261007-paginare';
