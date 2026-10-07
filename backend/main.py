@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -648,12 +649,31 @@ def _build_mp3(session_dir: Path, sentence_count: int) -> str | None:
     return f"/audio/{session_dir.name}/full.mp3"
 
 
+mimetypes.add_type("application/manifest+json", ".webmanifest")
+
+# Generated audio never changes once written (ids are random), so phones may keep
+# it and avoid downloading the same sentence again on replay or seek.
+CACHEABLE_AUDIO = {".wav", ".mp3", ".webm", ".ogg", ".m4a", ".aac"}
+
+
 class AudioFiles(StaticFiles):
     async def get_response(self, path, scope):
         if any(part.startswith(".") for part in path.replace("\\", "/").split("/")):
             raise HTTPException(404, "Fișier negăsit.")
-        return await super().get_response(path, scope)
+        response = await super().get_response(path, scope)
+        if response.status_code in (200, 206) and Path(path).suffix.lower() in CACHEABLE_AUDIO:
+            response.headers["Cache-Control"] = "public, max-age=86400"
+        return response
+
+
+class FrontendFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        # Revalidate on every load (cheap 304 via ETag) so a phone that kept the
+        # page open never mixes a new index.html with an old script.js.
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 app.mount("/audio", AudioFiles(directory=str(AUDIO_DIR)), name="audio")
-app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+app.mount("/", FrontendFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

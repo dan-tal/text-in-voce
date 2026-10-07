@@ -95,11 +95,52 @@ API: `GET /api/session/{id}/remarks`, `POST /api/session/{id}/remarks`
 (multipart: `audio`, `sentence_index`, opțional `duration`, `author`) și
 `DELETE /api/session/{id}/remarks/{remark_id}`. Limită: `MAX_REMARK_MB` (15).
 
+## Pe telefon
+
+Interfața e gândită întâi pentru telefon (testată la 320, 360, 390 px și în
+landscape), iar pe calculator rămâne la fel.
+
+- **Instalare**: în Chrome (Android) sau Safari (iPhone → Partajează → *Adaugă pe
+  ecranul principal*) aplicația se deschide ca o aplicație obișnuită, fără bara
+  browserului (`manifest.webmanifest` + iconițe în `frontend/icons/`).
+- **Ecran blocat și căști**: titlul documentului, pagina și butoanele
+  play/pauză/următoarea/anterioara (propoziție) apar pe ecranul blocat și în
+  notificări (Media Session API). „Anterioara" repornește mai întâi propoziția
+  începută, ca într-un player muzical.
+- **Fără pauze între propoziții**: propoziția următoare se descarcă în timp ce o
+  ascultați (nu se preîncarcă dacă browserul are *Economizor de date* activ). Audio
+  generat primește `Cache-Control` de 24 h, deci reascultarea nu consumă date.
+- **Generare fără întreruperi**: cât timp se generează audio, ecranul rămâne
+  aprins (Screen Wake Lock), altfel telefonul ar adormi și ar întrerupe cererea
+  HTTP lungă. Dacă totuși conexiunea cade, rândul arată *Reîncearcă*.
+- **Butonul Înapoi** închide foaia de remarcă vocală în loc să părăsească pagina
+  (și să piardă înregistrarea).
+- **Partajează** deschide meniul de partajare al telefonului (WhatsApp, SMS…);
+  pe calculator copiază linkul.
+- **Atingeri**: toate butoanele au cel puțin 44 px; fără stări `:hover` „lipite"
+  după atingere; fără întârziere sau zoom la dublu-tap (ciupitul pentru zoom
+  rămâne); iOS nu mai transformă numerele din text în linkuri de telefon;
+  adresele web lungi se rup în loc să lățească pagina. Sub text, butoanele
+  *Înapoi* / *Pagina următoare* sunt la îndemâna degetului mare.
+- **Zone sigure**: marginile respectă notch-ul și bara de acasă
+  (`viewport-fit=cover`), iar tastatura Android nu mai acoperă bara de jos.
+- La deschiderea unui document, pagina derulează direct la text.
+
+**Important pentru iPhone:** Safari nu redă audio de la un server care nu
+răspunde la cereri `Range` cu `206 Partial Content`. De aceea `fastapi` este
+fixat la `0.115.6` (Starlette ≥ 0.39); la `0.115.0` audio nu mergea pe iOS.
+Un test (`test_audio_supports_range_requests…`) pică dacă versiunea scade.
+
+`index.html`, `script.js` și `style.css` se servesc cu `Cache-Control: no-cache`
+(validare prin ETag → răspuns 304), ca un telefon care ține fila deschisă să nu
+combine o pagină nouă cu un script vechi după deploy.
+
 ## Structură
 
 ```
 backend/
   main.py           # FastAPI: /api/upload, extragere text, TTS, servire audio + frontend
+  library.py        # catalogul documentelor (SQLite), ștergere
   remarks.py        # remarci audio atașate paragrafelor
   requirements.txt
   Dockerfile
@@ -107,6 +148,9 @@ frontend/
   index.html
   style.css
   script.js
+  version.js
+  manifest.webmanifest   # aplicație instalabilă pe telefon
+  icons/                 # icon.svg, icon-192.png, icon-512.png, apple-touch-icon.png
 docker-compose.yml
 ```
 
@@ -165,11 +209,19 @@ pip install -r backend/requirements-test.txt
 python -m pytest tests -q
 ```
 
+Testele backend verifică și suportul `Range`/`206`, headerele de cache și
+manifestul aplicației.
+
 Testele de interfață verifică faptul că biblioteca și previzualizarea PDF nu mai
 sunt afișate, încărcarea simultană cu maximum trei documente recente, paginarea,
 ștergerea documentului activ, remarcile vocale, bara de jos, butoanele ascunse
 pentru linkurile partajate și lizibilitatea textului (contrast verificat în toate
-stările, inclusiv hover, foaia de înregistrare și dialogul de ștergere):
+stările, inclusiv hover, foaia de înregistrare și dialogul de ștergere).
+Pentru telefon (browser emulat cu atingere): fără scroll orizontal la 320–740 px,
+chiar și cu adrese web foarte lungi, ținte de minimum 44 px, controalele de pe
+ecranul blocat, preîncărcarea propoziției următoare, partajarea, butonul Înapoi
+din foaia de remarcă, ecranul ținut aprins la generare și footer-ul nemascat de
+bara de jos:
 
 ```bash
 npm install

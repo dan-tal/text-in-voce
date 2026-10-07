@@ -400,3 +400,55 @@ def test_audio_remarks_are_shared_served_validated_and_deleted_with_the_document
             assert (await client.post(path, data={"sentence_index": "0"}, files=wav)).status_code == 404
 
     asyncio.run(scenario())
+
+
+def test_audio_supports_range_requests_for_ios_safari_and_is_cacheable(backend, monkeypatch):
+    # Safari refuses to play (or seek in) <audio> unless the server answers byte ranges with 206.
+    audio_mount = next(route.app for route in main.app.routes if getattr(route, "path", None) == "/audio")
+    monkeypatch.setattr(audio_mount, "all_directories", [str(backend)])
+    session = main.process_document("note.txt", b"Primul paragraf.")
+    wav = f'/audio/{session["session_id"]}/0.wav'
+    total = (backend / session["session_id"] / "0.wav").stat().st_size
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as client:
+            probe = await client.get(wav, headers={"Range": "bytes=0-1"})   # what Safari sends first
+            assert probe.status_code == 206
+            assert probe.headers["content-range"] == f"bytes 0-1/{total}"
+            assert probe.headers["accept-ranges"] == "bytes"
+            assert len(probe.content) == 2
+            tail = await client.get(wav, headers={"Range": "bytes=44-"})
+            assert tail.status_code == 206 and len(tail.content) == total - 44
+            full = await client.get(wav)
+            assert full.status_code == 200 and len(full.content) == total
+            for response in (probe, full):
+                assert response.headers["cache-control"] == "public, max-age=86400"
+            # Mutable bookkeeping files are never cached by phones.
+            meta = await client.get(f'/audio/{session["session_id"]}/meta.json')
+            assert meta.status_code == 200 and "max-age" not in meta.headers.get("cache-control", "")
+            assert (await client.get(f'/audio/{session["session_id"]}/.hidden')).status_code == 404
+
+    asyncio.run(scenario())
+
+
+def test_frontend_is_revalidated_and_installable_on_phones():
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as client:
+            # A phone that kept the tab open must never mix a new page with an old script.
+            for path in ("/", "/script.js", "/style.css", "/manifest.webmanifest"):
+                response = await client.get(path)
+                assert response.status_code == 200, path
+                assert response.headers["cache-control"] == "no-cache", path
+                assert response.headers["etag"], path                        # so revalidation is a cheap 304
+                revalidated = await client.get(path, headers={"If-None-Match": response.headers["etag"]})
+                assert revalidated.status_code == 304, path
+            manifest = await client.get("/manifest.webmanifest")
+            assert manifest.headers["content-type"].startswith("application/manifest+json")
+            icons = manifest.json()["icons"]
+            assert {icon["sizes"] for icon in icons} >= {"192x192", "512x512"}
+            for icon in icons:
+                served = await client.get(icon["src"])
+                assert served.status_code == 200 and served.headers["content-type"] == icon["type"], icon["src"]
+            assert (await client.get("/icons/apple-touch-icon.png")).status_code == 200
+
+    asyncio.run(scenario())
