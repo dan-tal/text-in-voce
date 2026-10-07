@@ -2,7 +2,9 @@
 <html lang="ro">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#2a6df4">
+<meta name="color-scheme" content="light">
 <title>Text în voce</title>
 <link rel="stylesheet" href="style.css">
 </head>
@@ -33,34 +35,33 @@
     </section>
 
     <section id="player-section" class="card" hidden>
-      <div class="controls">
-        <div class="transport-group">
-          <button id="play-btn" title="Play">▶</button>
-          <button id="pause-btn" title="Pause" disabled>⏸</button>
-          <button id="stop-btn" title="Stop" disabled>⏹</button>
-        </div>
-        <label class="speed-control">
-          Viteză: <span id="speed-value">1.0x</span>
-          <input type="range" id="speed-slider" min="0.5" max="3" step="0.1" value="1">
-        </label>
-        <div class="action-group">
+      <div class="top-row">
+        <nav class="pagination" aria-label="Paginarea documentului">
+          <button type="button" id="prev-page" class="slim-btn" aria-label="Pagina anterioară">‹</button>
+          <form id="page-form">
+            <label for="page-input">Pagina</label>
+            <input type="number" id="page-input" min="1" step="1" value="1" required inputmode="numeric" enterkeyhint="go">
+            <span id="page-count">/ 1</span>
+          </form>
+          <button type="button" id="next-page" class="slim-btn" aria-label="Pagina următoare">›</button>
+        </nav>
+        <div id="owner-actions" class="action-group">
           <button type="button" id="share-btn" class="secondary-btn">🔗 Partajează</button>
           <a id="download-link" class="download-link" download="text-in-voce.mp3" hidden>⬇ MP3</a>
         </div>
       </div>
-      <nav class="pagination" aria-label="Paginarea documentului">
-        <button type="button" id="prev-page">← Prev</button>
-        <form id="page-form">
-          <label for="page-input">Pagina</label>
-          <input type="number" id="page-input" min="1" step="1" value="1" required inputmode="numeric">
-          <span id="page-count">/ 1</span>
-          <button type="submit">Mergi</button>
-        </form>
-        <button type="button" id="next-page">Next →</button>
-        <span id="page-kind" class="hint-inline"></span>
-      </nav>
-      <p class="hint">Apasă pe orice propoziție sau cuvânt din text pentru a sări acolo cu redarea.</p>
+      <p class="hint">Apasă pe o propoziție pentru a sări acolo. Oprește la un paragraf și apasă 🎙 pentru o remarcă vocală.</p>
       <div id="text-container"></div>
+      <div id="player-bar" class="player-bar">
+        <span id="remark-dock-target" class="remark-dock-target"></span>
+        <div class="bar-row">
+          <button type="button" id="play-btn" class="bar-play" aria-label="Redare">▶</button>
+          <button type="button" id="speed-btn" class="bar-speed" aria-label="Viteza de redare">1x</button>
+          <button type="button" id="remark-dock-btn" class="remark-big" aria-describedby="remark-dock-target">
+            <span aria-hidden="true">🎙</span> Remarcă
+          </button>
+        </div>
+      </div>
     </section>
   </main>
 
@@ -75,6 +76,29 @@
       </div>
     </form>
   </dialog>
+
+  <div id="remark-sheet" class="remark-sheet" role="dialog" aria-modal="true" aria-labelledby="remark-sheet-title" hidden>
+    <div class="remark-panel">
+      <h2 id="remark-sheet-title">Remarcă vocală</h2>
+      <p id="remark-sheet-target" class="remark-quote"></p>
+      <div id="remark-recording" class="remark-stage">
+        <div class="remark-timer" role="timer" aria-live="off"><span class="rec-dot" aria-hidden="true"></span><span id="remark-timer">0:00</span></div>
+        <button type="button" id="remark-stop" class="remark-big">⏹ Oprește înregistrarea</button>
+      </div>
+      <div id="remark-review" class="remark-stage" hidden>
+        <audio id="remark-preview" controls preload="metadata"></audio>
+        <label for="remark-author">Numele tău (opțional)</label>
+        <input id="remark-author" maxlength="60" autocomplete="name" enterkeyhint="done">
+        <div class="remark-actions">
+          <button type="button" id="remark-save" class="remark-big">Salvează remarca</button>
+          <button type="button" id="remark-redo" class="secondary-btn">🎙 Reia</button>
+        </div>
+      </div>
+      <p id="remark-error" class="remark-error" role="alert"></p>
+      <button type="button" id="remark-cancel" class="secondary-btn">Anulează</button>
+    </div>
+  </div>
+  <input type="file" id="remark-file" accept="audio/*" capture hidden aria-label="Înregistrează o remarcă cu aplicația telefonului">
 
   <footer>Elaborat de Dan T · <span id="app-version"></span></footer>
 

@@ -352,3 +352,51 @@ def test_library_finishes_interrupted_file_cleanup(backend):
     (trash / "leftover.wav").write_bytes(b"interrupted delete")
     assert main.get_library()["documents"] == []
     assert not trash.exists()
+
+
+def test_audio_remarks_are_shared_served_validated_and_deleted_with_the_document(backend, monkeypatch):
+    audio_mount = next(route.app for route in main.app.routes if getattr(route, "path", None) == "/audio")
+    monkeypatch.setattr(audio_mount, "all_directories", [str(backend)])
+    session = main.process_document("note.txt", b"Primul paragraf.\n\nAl doilea paragraf.")
+    session_id = session["session_id"]
+    path = f"/api/session/{session_id}/remarks"
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as client:
+            assert (await client.get(path)).json() == {"remarks": []}
+            created = await client.post(path, data={"sentence_index": "1", "duration": "4.5", "author": " Ana "},
+                                        files={"audio": ("remarca.webm", b"opus-bytes", "audio/webm;codecs=opus")})
+            assert created.status_code == 201
+            remark = created.json()
+            assert remark["sentence_index"] == 1 and remark["duration"] == 4.5 and remark["author"] == "Ana"
+            assert remark["audio_url"].startswith(f"/audio/{session_id}/remarks/") and remark["audio_url"].endswith(".webm")
+            # Another visitor sees it and can stream the audio.
+            assert (await client.get(path)).json()["remarks"] == [remark]
+            assert (await client.get(remark["audio_url"])).content == b"opus-bytes"
+
+            bad = lambda **kw: client.post(path, **kw)
+            wav = {"audio": ("x.wav", b"data", "audio/wav")}
+            assert (await bad(data={"sentence_index": "0"}, files={"audio": ("x.html", b"<script>", "text/html")})).status_code == 415
+            assert (await bad(data={"sentence_index": "0"}, files={"audio": ("x.webm", b"", "audio/webm")})).status_code == 400
+            assert (await bad(data={"sentence_index": "99"}, files=wav)).status_code == 400
+            assert (await bad(data={"sentence_index": "-1"}, files=wav)).status_code == 422
+            limit = main.MAX_REMARK_BYTES
+            monkeypatch.setattr(main, "MAX_REMARK_BYTES", 3)
+            assert (await bad(data={"sentence_index": "0"}, files=wav)).status_code == 413
+            monkeypatch.setattr(main, "MAX_REMARK_BYTES", limit)
+            assert (await client.post("/api/session/aaaaaaaaaaaa/remarks", data={"sentence_index": "0"}, files=wav)).status_code == 404
+            assert (await client.get("/api/session/invalid/remarks")).status_code == 404
+
+            assert (await client.delete(f"{path}/{'0' * 12}")).status_code == 404
+            assert (await client.delete(f"{path}/../x")).status_code in {404, 405}
+            assert (await client.delete(f'{path}/{remark["id"]}')).status_code == 204
+            assert (await client.get(path)).json() == {"remarks": []}
+            assert not list((backend / session_id / "remarks").iterdir())
+
+            kept = (await client.post(path, data={"sentence_index": "0"}, files=wav)).json()
+            assert (await client.delete(f"/api/library/{session_id}")).status_code == 204
+            assert (await client.get(kept["audio_url"])).status_code == 404
+            assert (await client.get(path)).status_code == 404
+            assert (await client.post(path, data={"sentence_index": "0"}, files=wav)).status_code == 404
+
+    asyncio.run(scenario())
