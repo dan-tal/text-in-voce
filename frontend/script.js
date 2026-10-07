@@ -29,6 +29,8 @@ let readerPages = [];
 let currentPage = 0;
 const sentencePages = new Map();
 const documentList = document.getElementById("document-list");
+const librarySection = document.getElementById("library-section");
+const libraryCount = document.getElementById("library-count");
 const librarySearch = document.getElementById("library-search");
 const libraryStatus = document.getElementById("library-status");
 const libraryEmpty = document.getElementById("library-empty");
@@ -80,6 +82,7 @@ uploadForm.addEventListener("submit", (e) => {
 });
 
 function enqueueFile(file) {
+  librarySection.open = true;
   const job = addDocument(file.name);
   job.file = file;
   uploadQueue.push(job);
@@ -184,6 +187,7 @@ async function openDocument(job) {
 }
 
 function filterLibrary() {
+  libraryCount.textContent = `${documents.length} ${documents.length === 1 ? "document" : "documente"}`;
   const query = librarySearch.value.trim().toLocaleLowerCase("ro");
   let visible = 0;
   documents.forEach((job) => {

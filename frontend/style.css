@@ -33,8 +33,22 @@
 .document-row.failed .document-status { color: #b42318; }
 .upload-hint { margin: 0.9rem 0 0; }
 .library-heading, .document-actions, .dialog-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
-.library-heading { justify-content: space-between; }
-.library-heading h2 { margin: 0; font-size: 1.25rem; }
+#library-section { padding: 0; overflow: hidden; }
+.library-heading { cursor: pointer; list-style: none; padding: 1.25rem 1.5rem; background: #f7faff; border-left: 4px solid var(--accent); flex-wrap: nowrap; }
+.library-heading::-webkit-details-marker { display: none; }
+.library-heading:hover { background: var(--accent-soft); }
+.library-heading:focus-visible { outline: 3px solid var(--accent); outline-offset: -3px; }
+.library-heading h2 { margin: 0; font-size: 1.15rem; flex: 1; min-width: 0; }
+.library-count { border-radius: 999px; padding: 0.4rem 0.7rem; background: var(--accent-soft); color: var(--accent); font-size: 0.8rem; font-weight: 700; white-space: nowrap; }
+.library-toggle { display: grid; place-items: center; flex-shrink: 0; width: 2.1rem; height: 2.1rem; border-radius: 50%; background: var(--accent); color: #fff; font-size: 1.5rem; }
+.library-toggle::before { content: "+"; }
+#library-section[open] .library-toggle::before { content: "−"; }
+.library-content { padding: 1.25rem 1.5rem; border-top: 2px solid var(--accent); }
+@media (max-width: 600px) {
+  .library-heading, .library-content { padding: 1rem; }
+  .library-heading h2 { font-size: 1rem; }
+  .library-count { padding: 0.3rem 0.5rem; font-size: 0.75rem; }
+}
 .library-search-label { display: block; margin-top: 1rem; font-size: 0.9rem; }
 #library-search, #document-name-input {
   width: 100%; margin-top: 0.4rem; padding: 0.7rem; font: inherit;

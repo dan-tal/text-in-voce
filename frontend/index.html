@@ -30,18 +30,22 @@
       <p id="status" class="status" role="status"></p>
     </section>
 
-    <section id="library-section" class="card" aria-labelledby="library-title">
-      <div class="library-heading">
+    <details id="library-section" class="card">
+      <summary class="library-heading">
         <h2 id="library-title">Biblioteca documentelor</h2>
+        <span id="library-count" class="library-count">0 documente</span>
+        <span class="library-toggle" aria-hidden="true"></span>
+      </summary>
+      <div class="library-content">
         <button type="button" id="library-refresh" class="secondary-btn">Actualizează</button>
-      </div>
       <p class="hint-inline">Bibliotecă comună pentru toți utilizatorii. Documentele rămân salvate; ștergerea le elimină pentru toată lumea.</p>
       <label class="library-search-label" for="library-search">Caută un document</label>
       <input type="search" id="library-search" placeholder="Numele documentului...">
       <p id="library-status" class="status" role="status"></p>
       <p id="library-empty" class="hint-inline" hidden>Biblioteca este goală. Adaugă documente folosind formularul de mai sus.</p>
       <ul id="document-list" aria-label="Documente în bibliotecă"></ul>
-    </section>
+      </div>
+    </details>
 
     <section id="player-section" class="card" hidden>
       <div class="controls">

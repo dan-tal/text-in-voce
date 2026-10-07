@@ -60,6 +60,10 @@ build), backend-ul reîncearcă automat la primul request către `/api/upload`.
 Documentele procesate apar automat în **Biblioteca documentelor**, comună pentru
 toți utilizatorii. Lista se reîncarcă la deschiderea paginii și rămâne disponibilă
 după repornirea containerului, în același volum Docker ca fișierele audio.
+Biblioteca este inițial pliată: apasă titlul pentru a o deschide sau închide.
+Antetul arată numărul documentelor și indicatorul +/−. Încărcarea unor fișiere
+noi o deschide automat pentru a putea urmări procesarea. Titlul poate fi
+activat și cu Enter sau Space de la tastatură.
 Poți căuta după nume, deschide un rezultat, redenumi sau șterge un document.
 Butonul **Actualizează** preia și modificările făcute de alți utilizatori.
 Lista încarcă doar rezumatele documentelor; textul integral se încarcă la deschidere.

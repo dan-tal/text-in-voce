@@ -8,7 +8,7 @@ const root = path.resolve(__dirname, "..");
 const html = fs.readFileSync(path.join(root, "frontend/index.html"), "utf8");
 const script = fs.readFileSync(path.join(root, "frontend/script.js"), "utf8");
 
-async function setup(t, query = "") {
+async function setup(t, query = "", openLibrary = true) {
   const browser = await chromium.launch({
     headless: true,
     ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : {}),
@@ -58,6 +58,7 @@ async function setup(t, query = "") {
     };
   });
   await page.addScriptTag({ content: script });
+  if (openLibrary) await page.locator("#library-section summary").click();
   return page;
 }
 
@@ -348,4 +349,25 @@ test("a late shared-session response preserves the renamed library title", async
   await loadSession(page, { ...pdfSession(), filename: "Numele original.pdf" });
   assert.equal(await page.locator(".document-row").count(), 1);
   assert.equal(await page.locator(".document-name").textContent(), "Raport redenumit");
+});
+
+test("library starts collapsed, shows its count and toggles by title or keyboard", async (t) => {
+  const page = await setup(t, "", false);
+  await page.evaluate(async () => {
+    window.libraryItems = [{ session_id: "aaaaaa", name: "Raport", sentence_count: 1 }];
+    await loadLibrary();
+  });
+  const heading = page.locator("#library-section summary");
+  assert.equal(await page.locator("#library-count").textContent(), "1 document");
+  assert.equal(await page.locator("#library-search").isVisible(), false);
+  await heading.click();
+  assert.equal(await page.locator("#library-search").isVisible(), true);
+  await heading.press("Enter");
+  assert.equal(await page.locator("#library-search").isVisible(), false);
+  await heading.press("Space");
+  assert.equal(await page.locator("#library-search").isVisible(), true);
+  await heading.click();
+  await submit(page, ["nou.txt"]);
+  assert.equal(await page.locator("#library-search").isVisible(), true);
+  assert.equal(await page.locator("#library-count").textContent(), "2 documente");
 });
