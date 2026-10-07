@@ -157,44 +157,54 @@ def _extract_blocks_txt(text: str) -> list[dict]:
     return blocks
 
 
-HIGHLIGHT_COLORS = {
-    "YELLOW": "#ffff00",
-    "BRIGHT_GREEN": "#00ff00",
-    "TURQUOISE": "#00ffff",
-    "PINK": "#ff00ff",
-    "BLUE": "#0000ff",
-    "RED": "#ff0000",
-    "DARK_BLUE": "#000080",
-    "TEAL": "#008080",
-    "GREEN": "#008000",
-    "VIOLET": "#800080",
-    "DARK_RED": "#800000",
-    "DARK_YELLOW": "#808000",
-    "GRAY_50": "#808080",
-    "GRAY_25": "#c0c0c0",
-    "BLACK": "#000000",
+W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+HIGHLIGHT_XML = {
+    "yellow": "#ffff00",
+    "green": "#00ff00",
+    "cyan": "#00ffff",
+    "magenta": "#ff00ff",
+    "blue": "#0000ff",
+    "red": "#ff0000",
+    "darkBlue": "#000080",
+    "darkCyan": "#008080",
+    "darkGreen": "#008000",
+    "darkMagenta": "#800080",
+    "darkRed": "#800000",
+    "darkYellow": "#808000",
+    "darkGray": "#808080",
+    "lightGray": "#c0c0c0",
+    "black": "#000000",
 }
 
 
 def _docx_run_highlight(run) -> str | None:
-    color = run.font.highlight_color
-    if color is not None:
-        name = getattr(color, "name", str(color)).upper()
-        return HIGHLIGHT_COLORS.get(name, "#ffff00")
-    shd = run._r.find(".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}shd")
+    # Read the XML directly: python-docx raises on values like w:val="none".
+    rpr = run._r.rPr
+    if rpr is None:
+        return None
+    highlight = rpr.find(f"{W_NS}highlight")
+    if highlight is not None:
+        val = highlight.get(f"{W_NS}val")
+        if val and val != "none":
+            return HIGHLIGHT_XML.get(val, "#ffff00")
+    shd = rpr.find(f"{W_NS}shd")
     if shd is not None:
-        fill = shd.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}fill")
+        fill = shd.get(f"{W_NS}fill")
         if fill and re.fullmatch(r"[0-9A-Fa-f]{6}", fill) and fill.lower() != "ffffff":
             return "#" + fill.lower()
     return None
 
 
 def _docx_paragraph_runs(p) -> list[dict]:
-    runs = [
-        _run(r.text, hl=_docx_run_highlight(r), b=r.bold, i=r.italic, u=bool(r.underline))
-        for r in p.runs
-        if r.text
-    ]
+    try:
+        runs = [
+            _run(r.text, hl=_docx_run_highlight(r), b=r.bold, i=r.italic, u=bool(r.underline))
+            for r in p.runs
+            if r.text
+        ]
+    except Exception:
+        # Odd formatting must never block reading the text itself.
+        return [_run(p.text)]
     # Runs inside hyperlinks etc. are not in p.runs; don't lose text if so.
     if "".join(r["t"] for r in runs).strip() != p.text.strip():
         return [_run(p.text)]
