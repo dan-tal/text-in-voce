@@ -8,7 +8,7 @@ const root = path.resolve(__dirname, "..");
 const html = fs.readFileSync(path.join(root, "frontend/index.html"), "utf8");
 const script = fs.readFileSync(path.join(root, "frontend/script.js"), "utf8");
 
-async function setup(t, query = "") {
+async function setup(t, query = "", openLibrary = true) {
   const browser = await chromium.launch({
     headless: true,
     ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : {}),
@@ -25,9 +25,28 @@ async function setup(t, query = "") {
   await page.goto(`http://test/${query}`);
   await page.evaluate(() => {
     window.pendingRequests = [];
-    window.fetch = (url, options) => new Promise((resolve) => {
-      window.pendingRequests.push({ url, name: options?.body.get("file").name, resolve });
-    });
+    window.libraryItems = [];
+    window.sessionResponses = {};
+    window.libraryError = false;
+    window.libraryErrorStatus = 500;
+    window.fetch = (url, options) => {
+      if (url === "/api/library") return Promise.resolve({ ok: true, json: async () => ({ documents: window.libraryItems }) });
+      if (window.sessionResponses[url]) return Promise.resolve({ ok: true, json: async () => window.sessionResponses[url] });
+      if (url.startsWith("/api/library/")) {
+        if (window.libraryError) return Promise.resolve({ ok: false, status: window.libraryErrorStatus, json: async () => ({ detail: "Ștergerea a eșuat" }) });
+        const id = url.split("/").pop();
+        if (options.method === "DELETE") {
+          window.libraryItems = window.libraryItems.filter((item) => item.session_id !== id);
+          return Promise.resolve({ ok: true, status: 204 });
+        }
+        const item = window.libraryItems.find((entry) => entry.session_id === id) || { session_id: id, sentence_count: 1 };
+        item.name = JSON.parse(options.body).name;
+        return Promise.resolve({ ok: true, json: async () => item });
+      }
+      return new Promise((resolve) => {
+        window.pendingRequests.push({ url, name: options?.body instanceof FormData ? options.body.get("file").name : null, resolve });
+      });
+    };
     window.Audio = class {
       currentTime = 0;
       duration = 1;
@@ -39,14 +58,18 @@ async function setup(t, query = "") {
     };
   });
   await page.addScriptTag({ content: script });
+  if (openLibrary) await page.locator("#library-section summary").click();
   return page;
 }
 
-async function submit(page, names) {
+async function submit(page, names, openLibrary = true) {
   await page.locator("#file-input").setInputFiles(names.map((name) => ({
     name, mimeType: "text/plain", buffer: Buffer.from("Salut."),
   })));
   await page.locator("#upload-btn").click();
+  if (openLibrary && !await page.locator("#library-section").evaluate((panel) => panel.open)) {
+    await page.locator("#library-section summary").click();
+  }
 }
 
 async function resolveRequest(page, index, name, error = false) {
@@ -57,6 +80,7 @@ async function resolveRequest(page, index, name, error = false) {
       blocks: [{ type: "paragraph", sentence_indices: [0] }],
       mp3_url: `/audio/${name}/full.mp3`,
     };
+    if (!error) window.sessionResponses[`/api/session/${name}`] = data;
     window.pendingRequests[index].resolve({
       ok: !error, status: error ? 429 : 200,
       json: async () => error ? { detail: "Coada este plină" } : data,
@@ -95,7 +119,7 @@ test("a failed document can be retried without losing successful results", async
   await resolveRequest(page, 0, "aaaaaa", true);
   await page.waitForFunction(() => window.pendingRequests.length === 3);
   assert.match(await page.locator(".document-row").nth(0).textContent(), /Coada este plină/);
-  await page.getByRole("button", { name: "Reîncearcă" }).click();
+  await page.locator("#document-list").getByRole("button", { name: "Reîncearcă" }).click();
   assert.equal(await page.evaluate(() => window.pendingRequests.length), 3);
   await resolveRequest(page, 1, "bbbbbb");
   await page.waitForFunction(() => window.pendingRequests.length === 4);
@@ -233,4 +257,171 @@ test("audio errors allow retry and page changes ignore interrupted play requests
   await page.evaluate(() => window.rejectPlay(new DOMException("Interrupted", "AbortError")));
   assert.equal(await page.locator("#play-btn").isEnabled(), false);
   assert.deepEqual(errors, []);
+});
+
+test("saved library loads summaries, searches, opens lazily and renames", async (t) => {
+  const page = await setup(t);
+  await page.evaluate(() => { window.libraryItems = [
+    { session_id: "aaaaaa", name: "Raport.pdf", sentence_count: 2 },
+    { session_id: "bbbbbb", name: "Manual.txt", sentence_count: 1 },
+  ]; });
+  await page.locator("#library-refresh").click();
+  assert.equal(await page.locator(".document-row").count(), 2);
+  assert.equal(await page.evaluate(() => window.pendingRequests.length), 0);
+  await page.locator("#library-search").fill("manual");
+  assert.equal(await page.locator(".document-row:visible").count(), 1);
+  await page.locator(".document-row:visible").getByRole("button", { name: "Deschide" }).click();
+  assert.equal(await page.evaluate(() => window.pendingRequests[0].url), "/api/session/bbbbbb");
+  await resolveRequest(page, 0, "bbbbbb");
+  await page.waitForFunction(() => !document.querySelector("#player-section").hidden);
+  await page.locator("#library-section summary").click();
+  await page.locator(".document-row:visible").getByRole("button", { name: "Redenumește" }).click();
+  await page.locator("#document-name-input").fill("Manual nou");
+  await page.getByRole("button", { name: "Salvează", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector("#document-dialog").open);
+  assert.equal(await page.locator(".document-row:visible .document-name").textContent(), "Manual nou");
+  await page.locator("#library-refresh").click();
+  assert.equal(await page.locator(".document-row:visible .document-name").textContent(), "Manual nou");
+});
+
+test("deletion confirms, preserves failed deletions and clears active playback on success", async (t) => {
+  const page = await setup(t);
+  await submit(page, ["one.txt"]);
+  await resolveRequest(page, 0, "aaaaaa");
+  await page.waitForFunction(() => !document.querySelector("#player-section").hidden);
+  await page.locator("#play-btn").click();
+  await page.locator("#document-list").getByRole("button", { name: "Șterge", exact: true }).click();
+  await page.getByRole("button", { name: "Anulează", exact: true }).click();
+  assert.equal(await page.locator(".document-row").count(), 1);
+  await page.evaluate(() => { window.libraryError = true; });
+  await page.locator("#document-list").getByRole("button", { name: "Șterge", exact: true }).click();
+  await page.getByRole("button", { name: "Șterge definitiv" }).click();
+  await page.waitForFunction(() => document.querySelector("#document-dialog-error").textContent.includes("eșuat"));
+  assert.equal(await page.locator(".document-row").count(), 1);
+  await page.evaluate(() => { window.libraryError = false; });
+  await page.getByRole("button", { name: "Șterge definitiv" }).click();
+  await page.waitForFunction(() => !document.querySelector("#document-dialog").open);
+  assert.equal(await page.locator(".document-row").count(), 0);
+  assert.equal(await page.locator("#player-section").isVisible(), false);
+  assert.equal(await page.evaluate(() => window.testAudio.paused), true);
+  assert.doesNotMatch(page.url(), /s=/);
+});
+
+test("queued and failed documents can be removed without orphaning a queued upload", async (t) => {
+  const page = await setup(t);
+  await submit(page, ["one.txt", "two.txt", "three.txt"]);
+  assert.equal(await page.locator(".document-row").nth(0).getByRole("button", { name: "Elimină" }).isEnabled(), false);
+  await page.locator(".document-row").nth(2).getByRole("button", { name: "Elimină" }).click();
+  assert.equal(await page.locator(".document-row").count(), 2);
+  await resolveRequest(page, 0, "aaaaaa", true);
+  await page.waitForFunction(() => document.querySelector(".document-row.failed"));
+  await page.locator(".document-row.failed").getByRole("button", { name: "Elimină" }).click();
+  await resolveRequest(page, 1, "bbbbbb");
+  assert.equal(await page.evaluate(() => window.pendingRequests.length), 2);
+  assert.equal(await page.locator(".document-row").count(), 1);
+});
+
+test("a stale open response cannot reopen a deleted library document", async (t) => {
+  const page = await setup(t);
+  await page.evaluate(() => { window.libraryItems = [{ session_id: "aaaaaa", name: "Raport", sentence_count: 1 }]; });
+  await page.locator("#library-refresh").click();
+  await page.getByRole("button", { name: "Deschide", exact: true }).click();
+  await page.locator("#library-section summary").click();
+  await page.locator("#document-list").getByRole("button", { name: "Șterge", exact: true }).click();
+  await page.getByRole("button", { name: "Șterge definitiv" }).click();
+  await page.waitForFunction(() => !document.querySelector("#document-dialog").open);
+  await resolveRequest(page, 0, "aaaaaa");
+  assert.equal(await page.locator("#player-section").isVisible(), false);
+  assert.equal(await page.locator(".document-row").count(), 0);
+});
+
+test("a document already deleted by another visitor is removed from the stale list", async (t) => {
+  const page = await setup(t);
+  await submit(page, ["one.txt"]);
+  await resolveRequest(page, 0, "aaaaaa");
+  await page.evaluate(() => { window.libraryError = true; window.libraryErrorStatus = 404; });
+  await page.locator("#document-list").getByRole("button", { name: "Șterge", exact: true }).click();
+  await page.getByRole("button", { name: "Șterge definitiv" }).click();
+  await page.waitForFunction(() => !document.querySelector("#document-dialog").open);
+  assert.equal(await page.locator(".document-row").count(), 0);
+  assert.equal(await page.locator("#player-section").isVisible(), false);
+});
+
+test("a late shared-session response preserves the renamed library title", async (t) => {
+  const page = await setup(t, "?s=aaaaaa");
+  await page.evaluate(() => { window.libraryItems = [{ session_id: "aaaaaa", name: "Raport redenumit", sentence_count: 2 }]; });
+  await page.locator("#library-refresh").click();
+  await loadSession(page, { ...pdfSession(), filename: "Numele original.pdf" });
+  assert.equal(await page.locator(".document-row").count(), 1);
+  assert.equal(await page.locator(".document-name").textContent(), "Raport redenumit");
+});
+
+test("library starts collapsed, shows its count and toggles by title or keyboard", async (t) => {
+  const page = await setup(t, "", false);
+  await page.evaluate(async () => {
+    window.libraryItems = [{ session_id: "aaaaaa", name: "Raport", sentence_count: 1 }];
+    await loadLibrary();
+  });
+  const heading = page.locator("#library-section summary");
+  assert.equal(await page.locator("#library-count").textContent(), "1 document");
+  assert.equal(await page.locator("#library-search").isVisible(), false);
+  await heading.click();
+  assert.equal(await page.locator("#library-search").isVisible(), true);
+  await heading.press("Enter");
+  assert.equal(await page.locator("#library-search").isVisible(), false);
+  await heading.press("Space");
+  assert.equal(await page.locator("#library-search").isVisible(), true);
+  await heading.click();
+  await submit(page, ["nou.txt"], false);
+  assert.equal(await page.locator("#library-search").isVisible(), false);
+  assert.equal(await page.locator("#library-count").textContent(), "2 documente");
+});
+
+test("recent uploads show at most three files while all completed documents stay in the library", async (t) => {
+  const page = await setup(t, "", false);
+  await submit(page, ["one.txt", "two.txt", "three.txt", "four.txt", "five.txt"], false);
+  assert.equal(await page.locator(".recent-document-row").count(), 3);
+  assert.deepEqual(await page.locator(".recent-document-row .document-name").allTextContents(), ["three.txt", "four.txt", "five.txt"]);
+  assert.equal(await page.locator("#library-search").isVisible(), false);
+  for (let index = 0; index < 5; index += 1) {
+    await page.waitForFunction((index) => window.pendingRequests.length > index, index);
+    await resolveRequest(page, index, (index + 1).toString(16).repeat(6));
+  }
+  await page.waitForFunction(() => document.querySelector("#status").textContent.startsWith("5 gata"));
+  assert.equal(await page.locator(".recent-document-row").count(), 3);
+  assert.equal(await page.locator("#document-list .document-row").count(), 5);
+  await page.locator("#library-section summary").click();
+  await page.locator("#document-list .document-row").nth(0).getByRole("button", { name: "Deschide", exact: true }).click();
+  assert.equal(await page.locator("#library-search").isVisible(), false);
+  assert.match(page.url(), /s=111111/);
+});
+
+test("deleting a recent document removes both copies and stops its player", async (t) => {
+  const page = await setup(t, "", false);
+  await submit(page, ["one.txt"], false);
+  await resolveRequest(page, 0, "aaaaaa");
+  await page.waitForFunction(() => !document.querySelector("#player-section").hidden);
+  await page.locator("#play-btn").click();
+  await page.locator("#recent-document-list").getByRole("button", { name: "Șterge", exact: true }).click();
+  await page.getByRole("button", { name: "Șterge definitiv" }).click();
+  await page.waitForFunction(() => !document.querySelector("#document-dialog").open);
+  assert.equal(await page.locator(".recent-document-row").count(), 0);
+  assert.equal(await page.locator("#document-list .document-row").count(), 0);
+  assert.equal(await page.locator("#player-section").isVisible(), false);
+  assert.doesNotMatch(page.url(), /s=/);
+});
+
+test("renaming a document updates its recent copy and deleting from the library removes both", async (t) => {
+  const page = await setup(t);
+  await submit(page, ["one.txt"]);
+  await resolveRequest(page, 0, "aaaaaa");
+  await page.locator("#document-list").getByRole("button", { name: "Redenumește" }).click();
+  await page.locator("#document-name-input").fill("Raport redenumit");
+  await page.getByRole("button", { name: "Salvează", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector("#document-dialog").open);
+  assert.equal(await page.locator(".recent-document-row .document-name").textContent(), "Raport redenumit");
+  await page.locator("#document-list").getByRole("button", { name: "Șterge", exact: true }).click();
+  await page.getByRole("button", { name: "Șterge definitiv" }).click();
+  await page.waitForFunction(() => !document.querySelector("#document-dialog").open);
+  assert.equal(await page.locator(".recent-document-row").count(), 0);
 });

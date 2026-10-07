@@ -55,6 +55,41 @@ build), backend-ul reîncearcă automat la primul request către `/api/upload`.
    direct, fără reîncărcare, cât timp containerul rulează.
    Linkul include și pagina selectată (`?s=<id>&p=<pagina>`).
 
+## Biblioteca comună
+
+Documentele procesate apar automat în **Biblioteca documentelor**, comună pentru
+toți utilizatorii. Lista se reîncarcă la deschiderea paginii și rămâne disponibilă
+după repornirea containerului, în același volum Docker ca fișierele audio.
+Biblioteca este inițial pliată: apasă titlul pentru a o deschide sau închide.
+Antetul arată numărul documentelor și indicatorul +/−. Apăsarea **Deschide**
+pliază biblioteca și deschide documentul în player. Titlul poate fi
+activat și cu Enter sau Space de la tastatură.
+
+Încărcările noi apar în lista de sus, cu maximum trei fișiere recente afișate;
+documentele mai vechi nu sunt șterse când ies din această listă. Toate rezultatele
+procesate apar și în biblioteca persistentă. Butonul **Șterge** din oricare dintre
+cele două liste elimină documentul din ambele și șterge audio, după confirmare.
+Coada continuă să proceseze toate fișierele chiar dacă sus sunt vizibile doar trei.
+Poți căuta după nume, deschide un rezultat, redenumi sau șterge un document.
+Butonul **Actualizează** preia și modificările făcute de alți utilizatori.
+Lista încarcă doar rezumatele documentelor; textul integral se încarcă la deschidere.
+
+**Șterge** cere confirmare și elimină documentul, audio WAV/MP3 și originalul PDF
+pentru toți utilizatorii. Linkul partajat nu va mai funcționa. Documentele din
+coada browserului și cele cu erori pot fi eliminate din listă; un document aflat
+în procesare poate fi șters după terminare. Erorile și coada neîncepută nu sunt
+păstrate după reîncărcarea paginii.
+
+Sesiunile create înainte de bibliotecă sunt importate automat la prima utilizare.
+Numele lor originale nu erau salvate, deci apar ca `Document <id>` și pot fi
+redenumite. Catalogul SQLite este salvat în `/app/static/audio/.library`,
+protejat de acces prin ruta de fișiere statice. Biblioteca nu folosește conturi:
+orice vizitator al aplicației poate vedea, redenumi și șterge documentele comune.
+
+API: `GET /api/library`, `PATCH /api/library/{id}` cu `{"name":"Nume nou"}` și
+`DELETE /api/library/{id}`. Metadatele și audio se citesc în continuare prin
+`/api/session/{id}` și `/audio/{id}/...`.
+
 ## Structură
 
 ```
@@ -109,8 +144,8 @@ Limitele sunt per proces Uvicorn (configurația Docker folosește un singur proc
 Creșterea numărului de procesări crește și memoria folosită de instanțele modelului.
 Propozițiile aceluiași document sunt sintetizate în ordine. Cererea HTTP rămâne
 deschisă până la terminare: pentru documente mari, configurează timeout-ul
-proxy-ului corespunzător. Lista documentelor din browser se păstrează doar cât
-pagina este deschisă; fiecare rezultat final poate fi redeschis prin linkul său.
+proxy-ului corespunzător. Documentele finalizate se păstrează în biblioteca
+comună până când sunt șterse; fiecare rezultat poate fi redeschis prin linkul său.
 
 ## Verificare
 

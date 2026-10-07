@@ -28,8 +28,26 @@
       </div>
       <p class="hint upload-hint">Poți selecta mai multe documente sau adăuga altele în timpul procesării.</p>
       <p id="status" class="status" role="status"></p>
-      <ul id="document-list" aria-label="Documente încărcate"></ul>
+      <ul id="recent-document-list" aria-label="Fișiere adăugate recent"></ul>
+      <p id="recent-documents-hint" class="hint-inline" hidden>Se afișează maximum 3 fișiere recente. Documentele procesate sunt păstrate în bibliotecă.</p>
     </section>
+
+    <details id="library-section" class="card">
+      <summary class="library-heading">
+        <h2 id="library-title">Biblioteca documentelor</h2>
+        <span id="library-count" class="library-count">0 documente</span>
+        <span class="library-toggle" aria-hidden="true"></span>
+      </summary>
+      <div class="library-content">
+        <button type="button" id="library-refresh" class="secondary-btn">Actualizează</button>
+      <p class="hint-inline">Bibliotecă comună pentru toți utilizatorii. Documentele rămân salvate; ștergerea le elimină pentru toată lumea.</p>
+      <label class="library-search-label" for="library-search">Caută un document</label>
+      <input type="search" id="library-search" placeholder="Numele documentului...">
+      <p id="library-status" class="status" role="status"></p>
+      <p id="library-empty" class="hint-inline" hidden>Biblioteca este goală. Adaugă documente folosind formularul de mai sus.</p>
+      <ul id="document-list" aria-label="Documente în bibliotecă"></ul>
+      </div>
+    </details>
 
     <section id="player-section" class="card" hidden>
       <div class="controls">
@@ -68,6 +86,20 @@
       </div>
     </section>
   </main>
+
+  <dialog id="document-dialog" aria-labelledby="document-dialog-title">
+    <form id="document-dialog-form">
+      <h2 id="document-dialog-title"></h2>
+      <p id="document-dialog-description"></p>
+      <label id="document-name-label" for="document-name-input">Numele documentului</label>
+      <input id="document-name-input" maxlength="200" autocomplete="off">
+      <p id="document-dialog-error" class="dialog-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" id="document-dialog-cancel" class="secondary-btn">Anulează</button>
+        <button type="submit" id="document-dialog-submit"></button>
+      </div>
+    </form>
+  </dialog>
 
   <footer>Elaborat de Dan T · <span id="app-version"></span></footer>
 

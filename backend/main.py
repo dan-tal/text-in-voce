@@ -12,15 +12,18 @@ import wave
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import docx
 from docx.table import Table
 import pdfplumber
 from piper import PiperVoice
+from pydantic import BaseModel, Field
+import library
 
 BASE_DIR = Path(__file__).parent
 MODELS_DIR = BASE_DIR / "models"
@@ -440,9 +443,11 @@ def process_document(filename: str, content: bytes) -> dict:
     session_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        return _synthesize_document(raw_blocks, voice, session_id, session_dir,
+        result = _synthesize_document(raw_blocks, voice, session_id, session_dir,
                                     content if Path(filename).suffix.lower() == ".pdf" else None,
-                                    metadata.get("page_count"))
+                                    metadata.get("page_count"), filename)
+        library.register(AUDIO_DIR, result)
+        return result
     except Exception as exc:
         shutil.rmtree(session_dir, ignore_errors=True)
         if isinstance(exc, HTTPException):
@@ -453,7 +458,7 @@ def process_document(filename: str, content: bytes) -> dict:
 
 def _synthesize_document(raw_blocks: list[dict], voice: PiperVoice,
                          session_id: str, session_dir: Path, original_pdf: bytes | None = None,
-                         page_count: int | None = None) -> dict:
+                         page_count: int | None = None, filename: str = "") -> dict:
     sentences = []
     blocks = []
     global_index = 0
@@ -504,17 +509,50 @@ def _synthesize_document(raw_blocks: list[dict], voice: PiperVoice,
 
     result = {
         "session_id": session_id,
+        "filename": Path(filename.replace("\\", "/")).name[:250],
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "sentences": sentences,
         "blocks": blocks,
         "mp3_url": mp3_url,
         "original_url": original_url,
         "page_count": page_count,
     }
-    (session_dir / "meta.json").write_text(json.dumps(result), encoding="utf-8")
+    partial = session_dir / "meta.json.part"
+    partial.write_text(json.dumps(result), encoding="utf-8")
+    partial.replace(session_dir / "meta.json")
     return result
 
 
 SESSION_ID_RE = re.compile(r"^[0-9a-f]{6,32}$")
+
+
+@app.get("/api/library")
+def get_library():
+    return {"documents": library.list_documents(AUDIO_DIR)}
+
+
+class DocumentName(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+
+@app.patch("/api/library/{session_id}")
+def rename_document(session_id: str, body: DocumentName):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "Introdu un nume pentru document.")
+    if not SESSION_ID_RE.fullmatch(session_id):
+        raise HTTPException(404, "Document negăsit.")
+    item = library.rename(AUDIO_DIR, session_id, name)
+    if item is None:
+        raise HTTPException(404, "Document negăsit.")
+    return item
+
+
+@app.delete("/api/library/{session_id}", status_code=204)
+def delete_document(session_id: str):
+    if not library.delete(AUDIO_DIR, session_id):
+        raise HTTPException(404, "Document negăsit.")
+    return Response(status_code=204)
 
 
 @app.get("/api/session/{session_id}")
@@ -522,9 +560,10 @@ def get_session(session_id: str):
     if not SESSION_ID_RE.fullmatch(session_id):
         raise HTTPException(404, "Sesiune negăsită sau expirată.")
     meta_path = AUDIO_DIR / session_id / "meta.json"
-    if not meta_path.exists():
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
         raise HTTPException(404, "Sesiune negăsită sau expirată.")
-    return json.loads(meta_path.read_text(encoding="utf-8"))
 
 
 def _build_mp3(session_dir: Path, sentence_count: int) -> str | None:
@@ -557,5 +596,12 @@ def _build_mp3(session_dir: Path, sentence_count: int) -> str | None:
     return f"/audio/{session_dir.name}/full.mp3"
 
 
-app.mount("/audio", StaticFiles(directory=str(AUDIO_DIR)), name="audio")
+class AudioFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        if any(part.startswith(".") for part in path.replace("\\", "/").split("/")):
+            raise HTTPException(404, "Fișier negăsit.")
+        return await super().get_response(path, scope)
+
+
+app.mount("/audio", AudioFiles(directory=str(AUDIO_DIR)), name="audio")
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
