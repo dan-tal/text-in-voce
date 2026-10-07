@@ -62,11 +62,14 @@ async function setup(t, query = "", openLibrary = true) {
   return page;
 }
 
-async function submit(page, names) {
+async function submit(page, names, openLibrary = true) {
   await page.locator("#file-input").setInputFiles(names.map((name) => ({
     name, mimeType: "text/plain", buffer: Buffer.from("Salut."),
   })));
   await page.locator("#upload-btn").click();
+  if (openLibrary && !await page.locator("#library-section").evaluate((panel) => panel.open)) {
+    await page.locator("#library-section summary").click();
+  }
 }
 
 async function resolveRequest(page, index, name, error = false) {
@@ -116,7 +119,7 @@ test("a failed document can be retried without losing successful results", async
   await resolveRequest(page, 0, "aaaaaa", true);
   await page.waitForFunction(() => window.pendingRequests.length === 3);
   assert.match(await page.locator(".document-row").nth(0).textContent(), /Coada este plină/);
-  await page.getByRole("button", { name: "Reîncearcă" }).click();
+  await page.locator("#document-list").getByRole("button", { name: "Reîncearcă" }).click();
   assert.equal(await page.evaluate(() => window.pendingRequests.length), 3);
   await resolveRequest(page, 1, "bbbbbb");
   await page.waitForFunction(() => window.pendingRequests.length === 4);
@@ -271,6 +274,7 @@ test("saved library loads summaries, searches, opens lazily and renames", async 
   assert.equal(await page.evaluate(() => window.pendingRequests[0].url), "/api/session/bbbbbb");
   await resolveRequest(page, 0, "bbbbbb");
   await page.waitForFunction(() => !document.querySelector("#player-section").hidden);
+  await page.locator("#library-section summary").click();
   await page.locator(".document-row:visible").getByRole("button", { name: "Redenumește" }).click();
   await page.locator("#document-name-input").fill("Manual nou");
   await page.getByRole("button", { name: "Salvează", exact: true }).click();
@@ -286,11 +290,11 @@ test("deletion confirms, preserves failed deletions and clears active playback o
   await resolveRequest(page, 0, "aaaaaa");
   await page.waitForFunction(() => !document.querySelector("#player-section").hidden);
   await page.locator("#play-btn").click();
-  await page.getByRole("button", { name: "Șterge", exact: true }).click();
+  await page.locator("#document-list").getByRole("button", { name: "Șterge", exact: true }).click();
   await page.getByRole("button", { name: "Anulează", exact: true }).click();
   assert.equal(await page.locator(".document-row").count(), 1);
   await page.evaluate(() => { window.libraryError = true; });
-  await page.getByRole("button", { name: "Șterge", exact: true }).click();
+  await page.locator("#document-list").getByRole("button", { name: "Șterge", exact: true }).click();
   await page.getByRole("button", { name: "Șterge definitiv" }).click();
   await page.waitForFunction(() => document.querySelector("#document-dialog-error").textContent.includes("eșuat"));
   assert.equal(await page.locator(".document-row").count(), 1);
@@ -322,7 +326,8 @@ test("a stale open response cannot reopen a deleted library document", async (t)
   await page.evaluate(() => { window.libraryItems = [{ session_id: "aaaaaa", name: "Raport", sentence_count: 1 }]; });
   await page.locator("#library-refresh").click();
   await page.getByRole("button", { name: "Deschide", exact: true }).click();
-  await page.getByRole("button", { name: "Șterge", exact: true }).click();
+  await page.locator("#library-section summary").click();
+  await page.locator("#document-list").getByRole("button", { name: "Șterge", exact: true }).click();
   await page.getByRole("button", { name: "Șterge definitiv" }).click();
   await page.waitForFunction(() => !document.querySelector("#document-dialog").open);
   await resolveRequest(page, 0, "aaaaaa");
@@ -335,7 +340,7 @@ test("a document already deleted by another visitor is removed from the stale li
   await submit(page, ["one.txt"]);
   await resolveRequest(page, 0, "aaaaaa");
   await page.evaluate(() => { window.libraryError = true; window.libraryErrorStatus = 404; });
-  await page.getByRole("button", { name: "Șterge", exact: true }).click();
+  await page.locator("#document-list").getByRole("button", { name: "Șterge", exact: true }).click();
   await page.getByRole("button", { name: "Șterge definitiv" }).click();
   await page.waitForFunction(() => !document.querySelector("#document-dialog").open);
   assert.equal(await page.locator(".document-row").count(), 0);
@@ -367,7 +372,56 @@ test("library starts collapsed, shows its count and toggles by title or keyboard
   await heading.press("Space");
   assert.equal(await page.locator("#library-search").isVisible(), true);
   await heading.click();
-  await submit(page, ["nou.txt"]);
-  assert.equal(await page.locator("#library-search").isVisible(), true);
+  await submit(page, ["nou.txt"], false);
+  assert.equal(await page.locator("#library-search").isVisible(), false);
   assert.equal(await page.locator("#library-count").textContent(), "2 documente");
+});
+
+test("recent uploads show at most three files while all completed documents stay in the library", async (t) => {
+  const page = await setup(t, "", false);
+  await submit(page, ["one.txt", "two.txt", "three.txt", "four.txt", "five.txt"], false);
+  assert.equal(await page.locator(".recent-document-row").count(), 3);
+  assert.deepEqual(await page.locator(".recent-document-row .document-name").allTextContents(), ["three.txt", "four.txt", "five.txt"]);
+  assert.equal(await page.locator("#library-search").isVisible(), false);
+  for (let index = 0; index < 5; index += 1) {
+    await page.waitForFunction((index) => window.pendingRequests.length > index, index);
+    await resolveRequest(page, index, (index + 1).toString(16).repeat(6));
+  }
+  await page.waitForFunction(() => document.querySelector("#status").textContent.startsWith("5 gata"));
+  assert.equal(await page.locator(".recent-document-row").count(), 3);
+  assert.equal(await page.locator("#document-list .document-row").count(), 5);
+  await page.locator("#library-section summary").click();
+  await page.locator("#document-list .document-row").nth(0).getByRole("button", { name: "Deschide", exact: true }).click();
+  assert.equal(await page.locator("#library-search").isVisible(), false);
+  assert.match(page.url(), /s=111111/);
+});
+
+test("deleting a recent document removes both copies and stops its player", async (t) => {
+  const page = await setup(t, "", false);
+  await submit(page, ["one.txt"], false);
+  await resolveRequest(page, 0, "aaaaaa");
+  await page.waitForFunction(() => !document.querySelector("#player-section").hidden);
+  await page.locator("#play-btn").click();
+  await page.locator("#recent-document-list").getByRole("button", { name: "Șterge", exact: true }).click();
+  await page.getByRole("button", { name: "Șterge definitiv" }).click();
+  await page.waitForFunction(() => !document.querySelector("#document-dialog").open);
+  assert.equal(await page.locator(".recent-document-row").count(), 0);
+  assert.equal(await page.locator("#document-list .document-row").count(), 0);
+  assert.equal(await page.locator("#player-section").isVisible(), false);
+  assert.doesNotMatch(page.url(), /s=/);
+});
+
+test("renaming a document updates its recent copy and deleting from the library removes both", async (t) => {
+  const page = await setup(t);
+  await submit(page, ["one.txt"]);
+  await resolveRequest(page, 0, "aaaaaa");
+  await page.locator("#document-list").getByRole("button", { name: "Redenumește" }).click();
+  await page.locator("#document-name-input").fill("Raport redenumit");
+  await page.getByRole("button", { name: "Salvează", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector("#document-dialog").open);
+  assert.equal(await page.locator(".recent-document-row .document-name").textContent(), "Raport redenumit");
+  await page.locator("#document-list").getByRole("button", { name: "Șterge", exact: true }).click();
+  await page.getByRole("button", { name: "Șterge definitiv" }).click();
+  await page.waitForFunction(() => !document.querySelector("#document-dialog").open);
+  assert.equal(await page.locator(".recent-document-row").count(), 0);
 });
