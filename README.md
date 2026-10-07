@@ -126,8 +126,8 @@ Limitele sunt per proces Uvicorn (configurația Docker folosește un singur proc
 Creșterea numărului de procesări crește și memoria folosită de instanțele modelului.
 Propozițiile aceluiași document sunt sintetizate în ordine. Cererea HTTP rămâne
 deschisă până la terminare: pentru documente mari, configurează timeout-ul
-proxy-ului corespunzător. Documentele finalizate se păstrează în biblioteca
-comună până când sunt șterse; fiecare rezultat poate fi redeschis prin linkul său.
+proxy-ului corespunzător. Documentele finalizate rămân pe disc până când sunt
+șterse; fiecare rezultat poate fi redeschis prin linkul său.
 
 ## Verificare
 
@@ -141,9 +141,9 @@ pip install -r backend/requirements-test.txt
 python -m pytest tests -q
 ```
 
-Testele de interfață verifică încărcarea multiplă, limita de două cereri,
-selectarea rezultatelor, reîncercarea erorilor, încărcarea linkurilor partajate,
-paginarea, paginile PDF goale, păstrarea formatării și coada pentru textul lipit:
+Testele de interfață verifică faptul că biblioteca și previzualizarea PDF nu mai
+sunt afișate, încărcarea simultană cu maximum trei documente recente, paginarea
+și ștergerea documentului activ:
 
 ```bash
 npm install
