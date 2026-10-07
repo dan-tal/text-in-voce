@@ -18,13 +18,18 @@ build), backend-ul reîncearcă automat la primul request către `/api/upload`.
 
 ## Cum funcționează
 
-1. Încarci un fișier (.docx / .pdf / .txt) din pagina principală.
+1. Încarci unul sau mai multe fișiere (.docx / .pdf / .txt) din pagina principală.
+   Interfața trimite maximum două documente simultan și păstrează restul în
+   așteptare. Poți adăuga altele fără să oprești redarea documentului curent.
+   Fiecare document are stare proprie, buton de deschidere și reîncercare la eroare.
 2. Backend-ul (FastAPI) extrage textul:
-   - `.docx` → `python-docx`
+   - `.docx` → `python-docx`, păstrând ordinea paragrafelor și tabelelor
    - `.pdf` → `pdfplumber`
    - `.txt` → citire directă
 3. Textul e împărțit în propoziții (regex pe `.`, `!`, `?`).
-4. Fiecare propoziție e sintetizată separat cu motorul TTS `piper-tts`
+4. Extragerea și sinteza rulează într-un grup separat de fire de execuție, astfel
+   încât serverul poate servi interfața, sesiunile și audio în timpul procesării.
+   Fiecare fir reutilizează propria instanță Piper. Fiecare propoziție e sintetizată separat cu motorul TTS `piper-tts`
    (modelul `ro_RO-mihai-medium`), generând câte un fișier `.wav`. Toate
    fișierele sunt apoi concatenate și convertite cu `ffmpeg` într-un singur
    `full.mp3`, descărcabil din interfață.
@@ -38,9 +43,17 @@ build), backend-ul reîncearcă automat la primul request către `/api/upload`.
    își schimbă pagina automat pe măsură ce se citește.
 7. Poți apăsa oricând pe o propoziție/cuvânt din text ca să sari acolo cu
    redarea, iar viteza e reglabilă între 0.5x și 3x.
+   Butoanele **Prev / Next** și câmpul **Pagina** permit navigarea în document.
+   Introdu numărul și apasă **Mergi** sau Enter. La PDF, numărul corespunde
+   paginii originale, inclusiv paginilor fără text; originalul și textul sunt
+   sincronizate. La TXT, DOCX și text lipit, paginile de lectură au aproximativ
+   3.000 de caractere, fără a despărți propozițiile. Acestea nu reprezintă
+   paginile de imprimare Word. Redarea continuă trece automat între pagini;
+   navigarea manuală oprește redarea, iar Play începe de pe pagina aleasă.
 8. Fiecare document procesat primește un link partajabil (`?s=<id>`) —
    metadatele sesiunii sunt salvate pe disc, deci link-ul poate fi redeschis
    direct, fără reîncărcare, cât timp containerul rulează.
+   Linkul include și pagina selectată (`?s=<id>&p=<pagina>`).
 
 ## Structură
 
@@ -72,6 +85,53 @@ trebuie să existe deja pe server):
 ```bash
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
+```
+
+## Limite și configurare
+
+Backend-ul acceptă implicit două procesări simultane, maximum opt documente
+în total (citire + procesare + așteptare) și fișiere de maximum 20 MB.
+Când coada este plină, `/api/upload` răspunde cu HTTP 429 și `Retry-After: 5`;
+un fișier prea mare primește HTTP 413. Rezultatele incomplete sunt șterse dacă
+sinteza eșuează. Dacă exportul MP3 eșuează sau depășește cinci minute, WAV-urile
+rămân disponibile pentru redare.
+
+Aceste valori se pot modifica prin variabile de mediu în serviciul Docker:
+
+```yaml
+environment:
+  PROCESSING_WORKERS: "2"
+  MAX_PENDING_DOCUMENTS: "8"
+  MAX_UPLOAD_MB: "20"
+```
+
+Limitele sunt per proces Uvicorn (configurația Docker folosește un singur proces).
+Creșterea numărului de procesări crește și memoria folosită de instanțele modelului.
+Propozițiile aceluiași document sunt sintetizate în ordine. Cererea HTTP rămâne
+deschisă până la terminare: pentru documente mari, configurează timeout-ul
+proxy-ului corespunzător. Lista documentelor din browser se păstrează doar cât
+pagina este deschisă; fiecare rezultat final poate fi redeschis prin linkul său.
+
+## Verificare
+
+Testele backend verifică procesarea paralelă, răspunsul HTTP în timpul sintezei,
+izolarea sesiunilor, coada plină, deconectarea clientului, fișierele invalide și
+curățarea rezultatelor parțiale. Folosesc un motor TTS simulat care produce WAV
+valid, fără a descărca modelul:
+
+```bash
+pip install -r backend/requirements-test.txt
+python -m pytest tests -q
+```
+
+Testele de interfață verifică încărcarea multiplă, limita de două cereri,
+selectarea rezultatelor, reîncercarea erorilor, încărcarea linkurilor partajate,
+paginarea, paginile PDF goale, păstrarea formatării și coada pentru textul lipit:
+
+```bash
+npm install
+npx playwright install chromium
+npm run test:frontend
 ```
 
 ## Note
