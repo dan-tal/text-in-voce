@@ -32,6 +32,28 @@
 .document-status { color: var(--muted); font-size: 0.85rem; }
 .document-row.failed .document-status { color: #b42318; }
 .upload-hint { margin: 0.9rem 0 0; }
+.library-heading, .document-actions, .dialog-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.library-heading { justify-content: space-between; }
+.library-heading h2 { margin: 0; font-size: 1.25rem; }
+.library-search-label { display: block; margin-top: 1rem; font-size: 0.9rem; }
+#library-search, #document-name-input {
+  width: 100%; margin-top: 0.4rem; padding: 0.7rem; font: inherit;
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.document-actions button { font-size: 0.85rem; padding: 0.6rem 0.75rem; }
+.danger-btn { background: #fee4e2; color: #b42318; }
+.danger-btn:hover:not(:disabled) { background: #fecdca; }
+dialog { width: min(480px, calc(100% - 2rem)); border: 1px solid var(--border); border-radius: 16px; padding: 1.5rem; color: var(--text); }
+dialog::backdrop { background: rgb(0 0 0 / 35%); }
+dialog h2 { margin-top: 0; }
+.dialog-actions { justify-content: flex-end; margin-top: 1rem; }
+.dialog-error { color: #b42318; min-height: 1.2em; }
+@media (max-width: 600px) {
+  main { width: 100%; padding: 0.75rem; }
+  .card { padding: 1rem; }
+  .document-name { flex-basis: 100%; }
+  .document-actions { width: 100%; }
+}
 
 .pagination, #page-form {
   display: flex;

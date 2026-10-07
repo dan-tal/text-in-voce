@@ -1,6 +1,7 @@
 """Exercise real HTTP routes, extraction and WAV output without downloading TTS."""
 import asyncio
 import io
+import json
 import sys
 import threading
 import types
@@ -263,3 +264,91 @@ def test_docx_styles_survive_concurrent_processing_refactor(backend):
     document.save(content)
     result = main.process_document("styled.docx", content.getvalue())
     assert result["sentences"][0]["runs"] == [{"t": "Text marcat.", "hl": "#ffff00", "b": True, "i": True, "u": True}]
+
+
+def test_shared_library_persists_renames_and_deletes_all_document_files(backend, monkeypatch):
+    audio_mount = next(route.app for route in main.app.routes if getattr(route, "path", None) == "/audio")
+    monkeypatch.setattr(audio_mount, "all_directories", [str(backend)])
+
+    def export(directory, count):
+        (directory / "full.mp3").write_bytes(b"test mp3")
+        return f"/audio/{directory.name}/full.mp3"
+
+    monkeypatch.setattr(main, "_build_mp3", export)
+
+    async def scenario():
+        async with main.app.router.lifespan_context(main.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as first:
+                response = await first.post("/api/upload", files={"file": ("Raport.pdf", make_pdf(["Salut."]))})
+                assert response.status_code == 200
+                session = response.json()
+                session_id = session["session_id"]
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as second:
+                    items = (await second.get("/api/library")).json()["documents"]
+                    assert len(items) == 1 and items[0]["name"] == "Raport.pdf"
+                    assert items[0]["sentence_count"] == 1 and items[0]["size_bytes"] > 0
+                    assert "sentences" not in items[0]
+                    assert (await second.patch(f"/api/library/{session_id}", json={"name": "  Raport nou  "})).json()["name"] == "Raport nou"
+                # Reopening a DB connection/browser retains the title.
+                assert (await first.get("/api/library")).json()["documents"][0]["name"] == "Raport nou"
+                for name in ["0.wav", "full.mp3", "original.pdf"]:
+                    assert (await first.get(f"/audio/{session_id}/{name}")).status_code == 200
+                assert (await first.delete(f"/api/library/{session_id}")).status_code == 204
+                assert not (backend / session_id).exists()
+                assert (await first.get("/api/library")).json() == {"documents": []}
+                assert (await first.get(f"/api/session/{session_id}")).status_code == 404
+                assert (await first.get(f"/audio/{session_id}/0.wav")).status_code == 404
+                assert (await first.delete(f"/api/library/{session_id}")).status_code == 404
+                assert (await first.get("/audio/.library/catalogue.sqlite3")).status_code == 404
+                assert (await first.get("/audio/%2elibrary/catalogue.sqlite3")).status_code == 404
+
+    asyncio.run(scenario())
+
+
+def test_library_imports_legacy_sessions_once_and_skips_incomplete_documents(backend):
+    good = backend / "abcdef123456"
+    good.mkdir()
+    (good / "meta.json").write_text(json.dumps({"session_id": good.name, "sentences": [{"text": "Salut."}]}))
+    broken = backend / "123456abcdef"
+    broken.mkdir()
+    (broken / "meta.json").write_text("incomplete")
+    assert main.get_library()["documents"][0]["name"] == "Document abcdef123456"
+    assert len(main.get_library()["documents"]) == 1
+    assert main.rename_document(good.name, main.DocumentName(name="Document vechi"))["name"] == "Document vechi"
+    assert main.get_library()["documents"][0]["name"] == "Document vechi"
+
+
+def test_library_rejects_invalid_titles_and_paths(backend):
+    session = main.process_document("file.txt", b"Salut.")
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as client:
+            path = f'/api/library/{session["session_id"]}'
+            assert (await client.patch(path, json={"name": "   "})).status_code == 400
+            assert (await client.patch(path, json={"name": "x" * 201})).status_code == 422
+            assert (await client.patch("/api/library/invalid", json={"name": "Nume"})).status_code == 404
+            assert (await client.delete("/api/library/invalid")).status_code == 404
+            assert (await client.delete("/api/library/%2e%2e%2f.library")).status_code in {404, 405}
+            assert (await client.get("/api/library")).json()["documents"][0]["name"] == "file.txt"
+    asyncio.run(scenario())
+
+
+def test_docx_highlight_none_remains_readable(backend):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    document = docx.Document()
+    run = document.add_paragraph().add_run("Text fără marker.")
+    highlight = OxmlElement("w:highlight")
+    highlight.set(qn("w:val"), "none")
+    run._r.get_or_add_rPr().append(highlight)
+    content = io.BytesIO()
+    document.save(content)
+    assert main.process_document("document.docx", content.getvalue())["sentences"][0]["text"] == "Text fără marker."
+
+
+def test_library_finishes_interrupted_file_cleanup(backend):
+    main.get_library()
+    trash = backend / ".library" / ("deleted-" + "a" * 32)
+    trash.mkdir()
+    (trash / "leftover.wav").write_bytes(b"interrupted delete")
+    assert main.get_library()["documents"] == []
+    assert not trash.exists()

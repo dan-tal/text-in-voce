@@ -29,6 +29,24 @@ let readerPages = [];
 let currentPage = 0;
 const sentencePages = new Map();
 const documentList = document.getElementById("document-list");
+const librarySearch = document.getElementById("library-search");
+const libraryStatus = document.getElementById("library-status");
+const libraryEmpty = document.getElementById("library-empty");
+const libraryRefresh = document.getElementById("library-refresh");
+const documentDialog = document.getElementById("document-dialog");
+const dialogForm = document.getElementById("document-dialog-form");
+const dialogTitle = document.getElementById("document-dialog-title");
+const dialogDescription = document.getElementById("document-dialog-description");
+const nameInput = document.getElementById("document-name-input");
+const nameLabel = document.getElementById("document-name-label");
+const dialogError = document.getElementById("document-dialog-error");
+const dialogSubmit = document.getElementById("document-dialog-submit");
+const dialogCancel = document.getElementById("document-dialog-cancel");
+let dialogJob = null;
+let dialogAction = null;
+let dialogBusy = false;
+let libraryLoadVersion = 0;
+let openingDocument = null;
 const documents = [];
 const uploadQueue = [];
 const MAX_PARALLEL_UPLOADS = 2;
@@ -80,10 +98,20 @@ function addDocument(name) {
   button.type = "button";
   button.textContent = "Deschide";
   button.disabled = true;
-  const job = { row, stateEl, button, state: "queued", data: null, file: null };
+  const renameButton = document.createElement("button");
+  renameButton.type = "button";
+  renameButton.textContent = "Redenumește";
+  renameButton.className = "secondary-btn";
+  renameButton.hidden = true;
+  const deleteButton = document.createElement("button");
+  deleteButton.type = "button";
+  deleteButton.textContent = "Elimină";
+  deleteButton.className = "danger-btn";
+  const job = { row, name, nameEl, stateEl, button, renameButton, deleteButton,
+    state: "queued", data: null, file: null, sessionId: null, removed: false };
   button.addEventListener("click", () => {
-    if (job.data) {
-      applySessionData(job.data);
+    if (job.state === "ready") {
+      openDocument(job);
     } else if (job.state === "failed") {
       job.state = "queued";
       row.classList.remove("failed");
@@ -93,11 +121,186 @@ function addDocument(name) {
       pumpUploads();
     }
   });
-  row.append(nameEl, stateEl, button);
+  renameButton.addEventListener("click", () => editDocument(job, "rename"));
+  deleteButton.addEventListener("click", () => {
+    if (job.state === "ready") editDocument(job, "delete");
+    else if (job.state !== "processing") removeDocument(job);
+  });
+  const actions = document.createElement("div");
+  actions.className = "document-actions";
+  actions.append(button, renameButton, deleteButton);
+  row.append(nameEl, stateEl, actions);
   documentList.appendChild(row);
   documents.push(job);
+  filterLibrary();
   return job;
 }
+
+function readyDocument(job, item, data = null) {
+  job.sessionId = item.session_id;
+  job.data = null;
+  job.state = "ready";
+  job.file = null;
+  job.name = item.name || data?.filename || job.name;
+  job.nameEl.textContent = job.name;
+  job.stateEl.textContent = `Gata: ${item.sentence_count ?? data?.sentences.length ?? 0} propoziții`;
+  job.button.textContent = "Deschide";
+  job.button.disabled = false;
+  job.renameButton.hidden = false;
+  job.deleteButton.textContent = "Șterge";
+  job.deleteButton.disabled = false;
+  job.row.classList.remove("failed");
+  job.row.classList.toggle("selected", job.sessionId === currentSessionId);
+  job.button.setAttribute("aria-pressed", String(job.sessionId === currentSessionId));
+  filterLibrary();
+}
+
+async function requestJson(url, options) {
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    const failure = new Error(error.detail || `Eroare server (${response.status})`);
+    failure.status = response.status;
+    throw failure;
+  }
+  return response.status === 204 ? null : response.json();
+}
+
+async function openDocument(job) {
+  const version = ++selectionVersion;
+  openingDocument = job;
+  job.button.disabled = true;
+  try {
+    // Fetch each time: another visitor may have deleted a shared document.
+    const data = await requestJson(`/api/session/${encodeURIComponent(job.sessionId)}`);
+    if (job.removed || version !== selectionVersion) return;
+    applySessionData(data);
+  } catch (error) {
+    libraryStatus.textContent = `Nu s-a putut deschide documentul: ${error.message}`;
+  } finally {
+    job.button.disabled = false;
+    if (openingDocument === job) openingDocument = null;
+  }
+}
+
+function filterLibrary() {
+  const query = librarySearch.value.trim().toLocaleLowerCase("ro");
+  let visible = 0;
+  documents.forEach((job) => {
+    job.row.hidden = !job.name.toLocaleLowerCase("ro").includes(query);
+    if (!job.row.hidden) visible += 1;
+  });
+  libraryEmpty.hidden = visible > 0;
+  libraryEmpty.textContent = documents.length ? "Nu există documente care corespund căutării." :
+    "Biblioteca este goală. Adaugă documente folosind formularul de mai sus.";
+}
+
+async function loadLibrary() {
+  const version = ++libraryLoadVersion;
+  const known = new Set(documents.filter((job) => job.state === "ready").map((job) => job.sessionId));
+  libraryRefresh.disabled = true;
+  libraryStatus.textContent = "Se încarcă biblioteca...";
+  try {
+    const result = await requestJson("/api/library");
+    if (version !== libraryLoadVersion) return;
+    const ids = new Set(result.documents.map((item) => item.session_id));
+    for (const job of [...documents]) {
+      if (job.state === "ready" && known.has(job.sessionId) && !ids.has(job.sessionId)) removeDocument(job);
+    }
+    for (const item of result.documents) {
+      const job = documents.find((entry) => entry.sessionId === item.session_id) || addDocument(item.name);
+      readyDocument(job, item);
+    }
+    libraryStatus.textContent = `${result.documents.length} documente salvate în biblioteca comună.`;
+    updateUploadStatus();
+  } catch (error) {
+    if (version === libraryLoadVersion) libraryStatus.textContent = `Nu s-a putut încărca biblioteca: ${error.message}`;
+  } finally {
+    libraryRefresh.disabled = false;
+  }
+}
+
+function removeDocument(job) {
+  job.removed = true;
+  job.file = null;
+  const queued = uploadQueue.indexOf(job);
+  if (queued >= 0) uploadQueue.splice(queued, 1);
+  const index = documents.indexOf(job);
+  if (index >= 0) documents.splice(index, 1);
+  job.row.remove();
+  if (openingDocument === job) { openingDocument = null; selectionVersion += 1; }
+  if (job.sessionId && job.sessionId === currentSessionId) {
+    selectionVersion += 1;
+    stopPlayback();
+    currentSessionId = null;
+    sentences = [];
+    readerPages = [];
+    sentenceElements.clear();
+    sentencePages.clear();
+    textContainer.replaceChildren();
+    originalFrame.onload = null;
+    originalFrame.removeAttribute("src");
+    originalUrl = null;
+    playerSection.hidden = true;
+    downloadLink.removeAttribute("href");
+    const url = new URL(window.location.href);
+    url.searchParams.delete("s"); url.searchParams.delete("p");
+    window.history.replaceState({}, "", url);
+  }
+  filterLibrary();
+  updateUploadStatus();
+}
+
+function editDocument(job, action) {
+  dialogJob = job; dialogAction = action;
+  const deleting = action === "delete";
+  dialogTitle.textContent = deleting ? "Ștergi documentul?" : "Redenumește documentul";
+  dialogDescription.textContent = deleting ?
+    `„${job.name}” și fișierele audio vor fi șterse definitiv pentru toți utilizatorii. Linkul partajat nu va mai funcționa.` :
+    "Noul nume va apărea în biblioteca comună.";
+  nameInput.hidden = nameLabel.hidden = deleting;
+  nameInput.required = !deleting;
+  nameInput.value = job.name;
+  dialogError.textContent = "";
+  dialogSubmit.textContent = deleting ? "Șterge definitiv" : "Salvează";
+  dialogSubmit.classList.toggle("danger-btn", deleting);
+  documentDialog.showModal();
+  if (!deleting) { nameInput.focus(); nameInput.select(); }
+}
+
+dialogCancel.addEventListener("click", () => documentDialog.close());
+documentDialog.addEventListener("cancel", (event) => { if (dialogBusy) event.preventDefault(); });
+dialogForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (dialogBusy || !dialogJob || dialogJob.removed) return;
+  const job = dialogJob;
+  const deleting = dialogAction === "delete";
+  const name = nameInput.value.trim();
+  if (!deleting && !name) { dialogError.textContent = "Introdu un nume pentru document."; return; }
+  dialogBusy = true;
+  dialogSubmit.disabled = dialogCancel.disabled = true;
+  libraryLoadVersion += 1;
+  if (deleting && currentSessionId === job.sessionId) stopPlayback();
+  try {
+    const item = await requestJson(`/api/library/${encodeURIComponent(job.sessionId)}`, deleting ?
+      { method: "DELETE" } : { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+    if (deleting) removeDocument(job);
+    else readyDocument(job, item, job.data);
+    documentDialog.close();
+    libraryStatus.textContent = deleting ? "Documentul și fișierele audio au fost șterse." : "Numele documentului a fost salvat.";
+  } catch (error) {
+    if (deleting && error.status === 404) {
+      removeDocument(job);
+      documentDialog.close();
+      libraryStatus.textContent = "Documentul a fost deja șters din biblioteca comună.";
+    } else dialogError.textContent = error.message;
+  } finally {
+    dialogBusy = false;
+    dialogSubmit.disabled = dialogCancel.disabled = false;
+  }
+});
+librarySearch.addEventListener("input", filterLibrary);
+libraryRefresh.addEventListener("click", loadLibrary);
 
 function updateUploadStatus() {
   const ready = documents.filter((job) => job.state === "ready").length;
@@ -111,6 +314,7 @@ function pumpUploads() {
     const job = uploadQueue.shift();
     activeUploads += 1;
     job.state = "processing";
+    job.deleteButton.disabled = true;
     job.stateEl.textContent = "Se trimite și se generează audio...";
     processUpload(job);
   }
@@ -127,19 +331,15 @@ async function processUpload(job) {
       throw new Error(err.detail || `Eroare server (${res.status})`);
     }
     const data = await res.json();
-    job.data = data;
-    job.file = null;
-    job.state = "ready";
-    job.stateEl.textContent = `Gata: ${data.sentences.length} propoziții`;
-    job.button.textContent = "Deschide";
-    job.button.disabled = false;
-    if (!currentSessionId) applySessionData(data);
+    readyDocument(job, { session_id: data.session_id, name: job.name }, data);
+    if (!currentSessionId && !openingDocument) applySessionData(data);
   } catch (err) {
     job.state = "failed";
     job.row.classList.add("failed");
     job.stateEl.textContent = `Eroare: ${err.message}`;
     job.button.textContent = "Reîncearcă";
     job.button.disabled = false;
+    job.deleteButton.disabled = false;
   } finally {
     activeUploads -= 1;
     pumpUploads();
@@ -187,9 +387,9 @@ function applySessionData(data) {
   stopPlayback();
   currentSessionId = data.session_id;
   documents.forEach((job) => {
-    const selected = job.data?.session_id === currentSessionId;
+    const selected = job.sessionId === currentSessionId;
     job.row.classList.toggle("selected", selected);
-    if (job.data) job.button.setAttribute("aria-pressed", String(selected));
+    if (job.sessionId) job.button.setAttribute("aria-pressed", String(selected));
   });
   playerSection.hidden = false;
 
@@ -243,11 +443,8 @@ shareBtn.addEventListener("click", async () => {
     }
     const data = await res.json();
     if (selectionVersion !== initialVersion) return;
-    const job = addDocument("Document partajat");
-    job.data = data;
-    job.state = "ready";
-    job.stateEl.textContent = `Gata: ${data.sentences.length} propoziții`;
-    job.button.disabled = false;
+    const job = documents.find((entry) => entry.sessionId === data.session_id) || addDocument(data.filename || "Document partajat");
+    readyDocument(job, { session_id: data.session_id, name: job.name }, data);
     applySessionData(data);
     const requestedPage = Number(params.get("p") || 1);
     if (Number.isInteger(requestedPage) && requestedPage >= 1 && requestedPage <= readerPages.length) {
@@ -258,6 +455,8 @@ shareBtn.addEventListener("click", async () => {
     if (selectionVersion === initialVersion) statusEl.textContent = `Eroare: ${err.message}`;
   }
 })();
+
+loadLibrary();
 
 function renderContent(data) {
   sentences = data.sentences;
