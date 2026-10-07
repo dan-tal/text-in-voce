@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Response
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import docx
@@ -24,6 +24,7 @@ import pdfplumber
 from piper import PiperVoice
 from pydantic import BaseModel, Field
 import library
+import remarks
 
 BASE_DIR = Path(__file__).parent
 MODELS_DIR = BASE_DIR / "models"
@@ -36,6 +37,7 @@ if not FRONTEND_DIR.exists():
 PROCESSING_WORKERS = max(1, int(os.getenv("PROCESSING_WORKERS", "2")))
 MAX_PENDING_DOCUMENTS = max(PROCESSING_WORKERS, int(os.getenv("MAX_PENDING_DOCUMENTS", "8")))
 MAX_UPLOAD_BYTES = max(1, int(os.getenv("MAX_UPLOAD_MB", "20"))) * 1024 * 1024
+MAX_REMARK_BYTES = max(1, int(os.getenv("MAX_REMARK_MB", "15"))) * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 MODEL_PATH = MODELS_DIR / "ro_RO-mihai-medium.onnx"
@@ -564,6 +566,56 @@ def get_session(session_id: str):
         return json.loads(meta_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         raise HTTPException(404, "Sesiune negăsită sau expirată.")
+
+
+def _document_dir(session_id: str) -> Path:
+    """Directory of an existing document, or 404."""
+    directory = AUDIO_DIR / session_id
+    if not SESSION_ID_RE.fullmatch(session_id) or not (directory / "meta.json").is_file():
+        raise HTTPException(404, "Sesiune negăsită sau expirată.")
+    return directory
+
+
+@app.get("/api/session/{session_id}/remarks")
+def get_remarks(session_id: str):
+    return {"remarks": remarks.list_remarks(_document_dir(session_id))}
+
+
+@app.post("/api/session/{session_id}/remarks", status_code=201)
+async def add_remark(session_id: str, audio: UploadFile = File(...),
+                     sentence_index: int = Form(..., ge=0),
+                     duration: float | None = Form(None, ge=0, le=3600),
+                     author: str = Form("", max_length=60)):
+    directory = _document_dir(session_id)
+    try:
+        extension = remarks.extension_for(audio.content_type)
+        if extension is None:
+            raise HTTPException(415, "Format audio neacceptat pentru remarcă.")
+        content = await audio.read(MAX_REMARK_BYTES + 1)
+    finally:
+        await audio.close()
+    if len(content) > MAX_REMARK_BYTES:
+        raise HTTPException(413, f"Remarca depășește limita de {MAX_REMARK_BYTES // (1024 * 1024)} MB.")
+    if not content:
+        raise HTTPException(400, "Înregistrarea este goală.")
+    try:
+        meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        raise HTTPException(404, "Documentul a fost șters.")
+    if sentence_index >= len(meta.get("sentences", [])):
+        raise HTTPException(400, "Paragraful nu există în document.")
+    try:
+        return await asyncio.to_thread(remarks.add, directory, session_id, sentence_index,
+                                       content, extension, duration, author.strip())
+    except FileNotFoundError:
+        raise HTTPException(404, "Documentul a fost șters.")
+
+
+@app.delete("/api/session/{session_id}/remarks/{remark_id}", status_code=204)
+def delete_remark(session_id: str, remark_id: str):
+    if not remarks.remove(_document_dir(session_id), remark_id):
+        raise HTTPException(404, "Remarcă negăsită.")
+    return Response(status_code=204)
 
 
 def _build_mp3(session_dir: Path, sentence_count: int) -> str | None:

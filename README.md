@@ -41,17 +41,21 @@ build), backend-ul reîncearcă automat la primul request către `/api/upload`.
 6. Formatarea din document (evidențiere/marker, bold, italic, subliniat) se
    păstrează în textul citit, afișat într-o singură coloană.
 7. Poți apăsa oricând pe o propoziție/cuvânt din text ca să sari acolo cu
-   redarea, iar viteza e reglabilă între 0.5x și 3x.
-   Butoanele **Prev / Next** și câmpul **Pagina** permit navigarea în document.
-   Introdu numărul și apasă **Mergi** sau Enter. La PDF, numărul corespunde
-   paginii originale, inclusiv paginilor fără text. La TXT, DOCX și text lipit, paginile de lectură au aproximativ
-   3.000 de caractere, fără a despărți propozițiile. Acestea nu reprezintă
-   paginile de imprimare Word. Redarea continuă trece automat între pagini;
+   redarea. Bara fixă din josul ecranului are trei butoane: **▶/⏸** (redare și
+   pauză), viteza (apăsări succesive: 0.75x, 1x, 1.25x, 1.5x, 2x, 3x) și **🎙 Remarcă**.
+   Sus, **‹ ›** și câmpul **Pagina** (Enter) navighează în document. La PDF,
+   numărul corespunde paginii originale, inclusiv paginilor fără text. La TXT,
+   DOCX și text lipit, paginile de lectură au aproximativ 3.000 de caractere,
+   fără a despărți propozițiile. Redarea continuă trece automat între pagini;
    navigarea manuală oprește redarea, iar Play începe de pe pagina aleasă.
 8. Fiecare document procesat primește un link partajabil (`?s=<id>`) —
    metadatele sesiunii sunt salvate pe disc, deci link-ul poate fi redeschis
    direct, fără reîncărcare, cât timp containerul rulează.
-   Linkul include și pagina selectată (`?s=<id>&p=<pagina>`).
+   Linkul include și pagina selectată (`?s=<id>&p=<pagina>`). Butoanele
+   **Partajează** și **MP3** apar doar pentru documentele generate în acest
+   browser; cine deschide un link primit poate citi, asculta și lăsa remarci,
+   dar nu le vede (e o alegere de interfață, nu o protecție: fișierele rămân
+   accesibile oricui are linkul).
 
 ## Documente recente și ștergere
 
@@ -72,11 +76,31 @@ salvate. API-urile existente rămân compatibile: `GET /api/library`,
 `PATCH /api/library/{id}` și `DELETE /api/library/{id}`. Proiectul nu folosește
 conturi; oricine are linkul unui document îl poate deschide și șterge.
 
+## Remarci vocale
+
+Când oprești citirea la un paragraf, apeși **🎙 Remarcă vocală** (bara fixă din
+josul ecranului, gândită pentru telefon) și spui remarca. Ținta este paragraful
+la care s-a oprit redarea, afișat și în bară; poți folosi și butonul **🎙 Remarcă**
+de sub orice paragraf. Redarea se oprește automat la început, ca microfonul să nu
+prindă vocea sintetică. Înregistrarea are cronometru, durează maximum 3 minute,
+iar după oprire o poți asculta și salva sau reface. Numele (opțional) se reține
+în browser.
+
+Remarcile sunt comune: apar sub paragraf ca butoane `▶ 0:12`
+pentru toți cei care deschid documentul, se pot șterge individual (✕) și dispar odată cu documentul.
+Microfonul cere HTTPS (sau localhost); fără el, pe telefon se deschide
+aplicația de înregistrare audio a dispozitivului.
+
+API: `GET /api/session/{id}/remarks`, `POST /api/session/{id}/remarks`
+(multipart: `audio`, `sentence_index`, opțional `duration`, `author`) și
+`DELETE /api/session/{id}/remarks/{remark_id}`. Limită: `MAX_REMARK_MB` (15).
+
 ## Structură
 
 ```
 backend/
   main.py           # FastAPI: /api/upload, extragere text, TTS, servire audio + frontend
+  remarks.py        # remarci audio atașate paragrafelor
   requirements.txt
   Dockerfile
 frontend/
@@ -142,8 +166,10 @@ python -m pytest tests -q
 ```
 
 Testele de interfață verifică faptul că biblioteca și previzualizarea PDF nu mai
-sunt afișate, încărcarea simultană cu maximum trei documente recente, paginarea
-și ștergerea documentului activ:
+sunt afișate, încărcarea simultană cu maximum trei documente recente, paginarea,
+ștergerea documentului activ, remarcile vocale, bara de jos, butoanele ascunse
+pentru linkurile partajate și lizibilitatea textului (contrast verificat în toate
+stările, inclusiv hover, foaia de înregistrare și dialogul de ștergere):
 
 ```bash
 npm install
