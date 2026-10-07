@@ -316,3 +316,88 @@ footer {
   background: var(--highlight-word);
   color: #fff;
 }
+
+/* Formatting carried over from the original document */
+.word.hl {
+  background: var(--hl);
+  color: #000;
+}
+
+.word.b {
+  font-weight: 700;
+}
+
+.word.i {
+  font-style: italic;
+}
+
+.word.u {
+  text-decoration: underline;
+}
+
+/* Side-by-side original (PDF) + read-along text */
+#reader-layout.with-original {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1.5rem;
+  align-items: start;
+}
+
+#reader-layout.with-original #text-container {
+  max-width: none;
+  max-height: 80vh;
+  overflow-y: auto;
+  margin: 0;
+}
+
+#original-pane {
+  position: sticky;
+  top: 1rem;
+}
+
+.pane-title {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+
+#original-frame {
+  width: 100%;
+  height: 80vh;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+
+@media (max-width: 900px) {
+  #reader-layout.with-original {
+    grid-template-columns: 1fr;
+  }
+}
+
+.paste-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.hint-inline {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+#paste-box {
+  margin-top: 0.75rem;
+}
+
+#paste-box textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.75rem;
+  margin-bottom: 0.5rem;
+  font: inherit;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  resize: vertical;
+}

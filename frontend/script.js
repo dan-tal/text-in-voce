@@ -10,12 +10,21 @@ const stopBtn = document.getElementById("stop-btn");
 const speedSlider = document.getElementById("speed-slider");
 const speedValue = document.getElementById("speed-value");
 const downloadLink = document.getElementById("download-link");
+const pasteBtn = document.getElementById("paste-btn");
+const pasteBox = document.getElementById("paste-box");
+const pasteText = document.getElementById("paste-text");
+const pasteSubmit = document.getElementById("paste-submit");
 const shareBtn = document.getElementById("share-btn");
+const originalPane = document.getElementById("original-pane");
+const originalFrame = document.getElementById("original-frame");
+const readerLayout = document.getElementById("reader-layout");
 
 let sentences = [];
 let currentIndex = -1;
 let playbackRate = 1.0;
 let currentSessionId = null;
+let originalUrl = null;
+let shownPage = null;
 const audio = new Audio();
 
 const versionEl = document.getElementById("app-version");
@@ -23,12 +32,15 @@ if (versionEl && window.APP_VERSION) {
   versionEl.textContent = `v${window.APP_VERSION}`;
 }
 
-uploadForm.addEventListener("submit", async (e) => {
+uploadForm.addEventListener("submit", (e) => {
   e.preventDefault();
   const file = fileInput.files[0];
-  if (!file) return;
+  if (file) uploadFile(file);
+});
 
+async function uploadFile(file) {
   uploadBtn.disabled = true;
+  pasteSubmit.disabled = true;
   statusEl.textContent = "Se procesează fișierul și se generează audio... poate dura câteva zeci de secunde.";
   playerSection.hidden = true;
   stopPlayback();
@@ -48,13 +60,59 @@ uploadForm.addEventListener("submit", async (e) => {
     statusEl.textContent = `Eroare: ${err.message}`;
   } finally {
     uploadBtn.disabled = false;
+    pasteSubmit.disabled = false;
   }
+}
+
+function openPasteBox(text) {
+  pasteBox.hidden = false;
+  if (text !== undefined) pasteText.value = text;
+  pasteText.focus();
+}
+
+pasteBtn.addEventListener("click", async () => {
+  let text;
+  try {
+    text = await navigator.clipboard.readText();
+  } catch (err) {
+    // Clipboard read blocked: show the box so the user can press Ctrl+V in it.
+  }
+  openPasteBox(text || undefined);
+});
+
+document.addEventListener("paste", (e) => {
+  const tag = (e.target.tagName || "").toLowerCase();
+  if (tag === "textarea" || tag === "input") return;
+  const text = e.clipboardData && e.clipboardData.getData("text");
+  if (!text || !text.trim()) return;
+  e.preventDefault();
+  openPasteBox(text);
+});
+
+pasteSubmit.addEventListener("click", () => {
+  const text = pasteText.value.trim();
+  if (!text) {
+    statusEl.textContent = "Textul este gol.";
+    return;
+  }
+  uploadFile(new File([text], "text-lipit.txt", { type: "text/plain" }));
 });
 
 function applySessionData(data) {
   currentSessionId = data.session_id;
   renderContent(data);
   playerSection.hidden = false;
+
+  originalUrl = data.original_url || null;
+  shownPage = null;
+  originalPane.hidden = !originalUrl;
+  readerLayout.classList.toggle("with-original", !!originalUrl);
+  if (originalUrl) {
+    const firstPage = (data.sentences.find((x) => x.page) || {}).page || 1;
+    showOriginalPage(firstPage);
+  } else {
+    originalFrame.removeAttribute("src");
+  }
 
   if (data.mp3_url) {
     downloadLink.href = data.mp3_url;
@@ -123,17 +181,32 @@ function buildSentenceEl(s) {
   const sentenceEl = document.createElement("span");
   sentenceEl.className = "sentence";
   sentenceEl.dataset.index = s.index;
+  sentenceEl.dataset.length = s.text.length;
 
-  const words = s.text.split(/(\s+)/); // keep whitespace tokens
-  words.forEach((token) => {
-    if (token.trim() === "") {
-      sentenceEl.appendChild(document.createTextNode(token));
-    } else {
-      const wordEl = document.createElement("span");
-      wordEl.className = "word";
-      wordEl.textContent = token;
-      sentenceEl.appendChild(wordEl);
-    }
+  // Runs carry the original formatting (highlight, bold, italic, underline).
+  const runs = s.runs && s.runs.length ? s.runs : [{ t: s.text }];
+  let offset = 0;
+  runs.forEach((run) => {
+    run.t.split(/(\s+)/).forEach((token) => {
+      if (token === "") return;
+      if (token.trim() === "") {
+        sentenceEl.appendChild(document.createTextNode(token));
+      } else {
+        const wordEl = document.createElement("span");
+        wordEl.className = "word";
+        wordEl.dataset.start = offset;
+        wordEl.textContent = token;
+        if (run.hl) {
+          wordEl.classList.add("hl");
+          wordEl.style.setProperty("--hl", run.hl);
+        }
+        if (run.b) wordEl.classList.add("b");
+        if (run.i) wordEl.classList.add("i");
+        if (run.u) wordEl.classList.add("u");
+        sentenceEl.appendChild(wordEl);
+      }
+      offset += token.length;
+    });
   });
 
   sentenceEl.appendChild(document.createTextNode(" "));
@@ -162,6 +235,7 @@ function playSentence(index, startFraction = 0) {
     sentenceEl.classList.add("active");
     sentenceEl.scrollIntoView({ behavior: "smooth", block: "center" });
   }
+  showOriginalPage(sentence.page);
 
   audio.src = sentence.audio_url;
   audio.playbackRate = playbackRate;
@@ -180,6 +254,12 @@ function playSentence(index, startFraction = 0) {
   playBtn.disabled = true;
   pauseBtn.disabled = false;
   stopBtn.disabled = false;
+}
+
+function showOriginalPage(page) {
+  if (!originalUrl || !page || page === shownPage) return;
+  shownPage = page;
+  originalFrame.src = `${originalUrl}#page=${page}`;
 }
 
 function seekTo(index, startFraction = 0) {
@@ -202,9 +282,8 @@ textContainer.addEventListener("click", (e) => {
   const wordEl = e.target.closest(".word");
   let startFraction = 0;
   if (wordEl) {
-    const words = Array.from(sentenceEl.querySelectorAll(".word"));
-    const wordIdx = words.indexOf(wordEl);
-    if (wordIdx > 0) startFraction = wordIdx / words.length;
+    const length = parseInt(sentenceEl.dataset.length, 10);
+    startFraction = length ? parseInt(wordEl.dataset.start, 10) / length : 0;
   }
 
   seekTo(index, startFraction);
@@ -217,11 +296,16 @@ audio.addEventListener("timeupdate", () => {
   const words = sentenceEl.querySelectorAll(".word");
   if (words.length === 0) return;
 
-  const progress = Math.min(audio.currentTime / audio.duration, 1);
-  const wordIndex = Math.min(Math.floor(progress * words.length), words.length - 1);
+  const length = parseInt(sentenceEl.dataset.length, 10);
+  const pos = Math.min(audio.currentTime / audio.duration, 1) * length;
+  let current = words[0];
+  for (const w of words) {
+    if (parseInt(w.dataset.start, 10) <= pos) current = w;
+    else break;
+  }
 
   words.forEach((w) => w.classList.remove("active"));
-  words[wordIndex].classList.add("active");
+  current.classList.add("active");
 });
 
 audio.addEventListener("ended", () => {

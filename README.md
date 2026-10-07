@@ -33,9 +33,12 @@ build), backend-ul reîncearcă automat la primul request către `/api/upload`.
    liniară a `currentTime / duration` peste numărul de cuvinte, cuvântul
    curent aproximativ (motorul TTS nu expune timestamp-uri per-cuvânt, deci e
    o aproximare, nu un timing exact din model).
-6. Poți apăsa oricând pe o propoziție/cuvânt din text ca să sari acolo cu
+6. Formatarea din document (evidențiere/marker, bold, italic, subliniat) se
+   păstrează în textul citit. Pentru `.pdf`, originalul apare alături și
+   își schimbă pagina automat pe măsură ce se citește.
+7. Poți apăsa oricând pe o propoziție/cuvânt din text ca să sari acolo cu
    redarea, iar viteza e reglabilă între 0.5x și 3x.
-7. Fiecare document procesat primește un link partajabil (`?s=<id>`) —
+8. Fiecare document procesat primește un link partajabil (`?s=<id>`) —
    metadatele sesiunii sunt salvate pe disc, deci link-ul poate fi redeschis
    direct, fără reîncărcare, cât timp containerul rulează.
 

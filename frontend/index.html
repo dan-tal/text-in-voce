@@ -18,6 +18,14 @@
         <input type="file" id="file-input" accept=".docx,.pdf,.txt" required>
         <button type="submit" id="upload-btn">Încarcă și generează audio</button>
       </form>
+      <div class="paste-row">
+        <button type="button" id="paste-btn" class="secondary-btn">📋 Lipește text din clipboard</button>
+        <span class="hint-inline">sau apasă Ctrl+V oriunde în pagină</span>
+      </div>
+      <div id="paste-box" hidden>
+        <textarea id="paste-text" rows="8" placeholder="Lipește sau scrie textul aici..."></textarea>
+        <button type="button" id="paste-submit">Generează audio din text</button>
+      </div>
       <p id="status" class="status"></p>
     </section>
 
@@ -38,7 +46,13 @@
         </div>
       </div>
       <p class="hint">Apasă pe orice propoziție sau cuvânt din text pentru a sări acolo cu redarea.</p>
-      <div id="text-container"></div>
+      <div id="reader-layout">
+        <aside id="original-pane" hidden>
+          <div class="pane-title">Original</div>
+          <iframe id="original-frame" title="Documentul original"></iframe>
+        </aside>
+        <div id="text-container"></div>
+      </div>
     </section>
   </main>
 
