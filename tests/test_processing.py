@@ -567,3 +567,51 @@ def test_delete_succeeds_even_if_private_disk_cleanup_must_be_retried(backend, m
     monkeypatch.setattr(main.library.shutil, "rmtree", original)
     assert main.get_library()["documents"] == []
     assert not list((backend / ".library").glob("deleted-*"))
+
+
+def test_disconnect_during_status_write_still_enqueues_the_document(backend, monkeypatch):
+    release = threading.Event()
+    started = threading.Event()
+    create = main.jobs.create
+    job_id = "c" * 32
+
+    def slow_create(*args):
+        started.set()
+        assert release.wait(5)
+        return create(*args)
+
+    monkeypatch.setattr(main.jobs, "create", slow_create)
+
+    async def scenario():
+        async with main.app.router.lifespan_context(main.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as client:
+                request = asyncio.create_task(client.post("/api/jobs", data={"request_id": job_id},
+                                                         files={"file": ("one.txt", "Salut.")}))
+                try:
+                    await wait_until(started.is_set)
+                    request.cancel()
+                    # Let cancellation reach the await of the status write.
+                    await asyncio.sleep(0)
+                    assert main.app.state.pending_documents == 1
+                finally:
+                    release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+                await wait_until(lambda: main.app.state.pending_documents == 0)
+                retry = await client.post("/api/jobs", data={"request_id": job_id},
+                                          files={"file": ("one.txt", "Salut.")})
+                assert retry.status_code == 202 and retry.json()["status"] == "ready"
+                assert len(main.get_library()["documents"]) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("data", [[], {"status": "ready"},
+                                  {"job_id": "d" * 32, "status": [], "updated_at": 0},
+                                  {"job_id": "d" * 32, "status": "ready", "updated_at": "invalid"}])
+def test_corrupt_status_records_do_not_break_recovery_or_polling(backend, data):
+    directory = backend / ".jobs"
+    directory.mkdir()
+    (directory / f'{"d" * 32}.json').write_text(json.dumps(data))
+    main.jobs.recover(backend)
+    assert main.jobs.read(backend, "d" * 32) is None

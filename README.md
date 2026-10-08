@@ -132,8 +132,9 @@ landscape), iar pe calculator rămâne la fel.
 - La deschiderea unui document, pagina derulează direct la text.
 
 **Important pentru iPhone:** Safari nu redă audio de la un server care nu
-răspunde la cereri `Range` cu `206 Partial Content`. De aceea `fastapi` este
-fixat la `0.115.6` (Starlette ≥ 0.39); la `0.115.0` audio nu mergea pe iOS.
+răspunde la cereri `Range` cu `206 Partial Content`. Dependențele actuale
+(`fastapi==0.142.4`, `starlette==1.7.0`) includ acest suport; versiunea veche
+`fastapi==0.115.0` nu îl oferea prin Starlette-ul instalat atunci.
 Un test (`test_audio_supports_range_requests…`) pică dacă versiunea scade.
 
 `index.html`, `script.js` și `style.css` se servesc cu `Cache-Control: no-cache`

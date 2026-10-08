@@ -448,8 +448,18 @@ async def submit_upload(file: UploadFile, background: bool, request_id=None):
         content = await file.read(MAX_UPLOAD_BYTES + 1)
         if len(content) > MAX_UPLOAD_BYTES:
             raise HTTPException(413, f"Fișierul depășește limita de {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
-        job = await asyncio.to_thread(jobs.create, AUDIO_DIR,
-                                    Path(filename.replace("\\", "/")).name[:250], request_id) if background else None
+        job = None
+        interrupted = False
+        if background:
+            creating = asyncio.create_task(asyncio.to_thread(
+                jobs.create, AUDIO_DIR, Path(filename.replace("\\", "/")).name[:250], request_id))
+            try:
+                job = await asyncio.shield(creating)
+            except asyncio.CancelledError:
+                # Once input is read, finish enqueueing even when the client
+                # loses the acknowledgement. A retry can then find this job.
+                job = await creating
+                interrupted = True
         future = asyncio.get_running_loop().run_in_executor(
             app.state.processing_pool, run_job if background else process_document,
             *([job["job_id"], filename, content] if background else [filename, content])
@@ -465,6 +475,8 @@ async def submit_upload(file: UploadFile, background: bool, request_id=None):
                 job.exception()
 
         future.add_done_callback(completed)
+        if interrupted:
+            raise asyncio.CancelledError
         if background:
             return job
         # Client cancellation must not free a slot while its thread still runs.

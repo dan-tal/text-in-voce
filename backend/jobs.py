@@ -21,9 +21,15 @@ def read(root, job_id):
         return None
     with _lock:
         try:
-            return json.loads((_directory(root) / f"{job_id}.json").read_text(encoding="utf-8"))
+            data = json.loads((_directory(root) / f"{job_id}.json").read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError):
             return None
+        if (not isinstance(data, dict) or data.get("job_id") != job_id
+                or not isinstance(data.get("status"), str)
+                or data["status"] not in {"queued", "processing", "ready", "failed"}
+                or not isinstance(data.get("updated_at"), (int, float))):
+            return None
+        return data
 
 
 def update(root, job_id, **fields):
