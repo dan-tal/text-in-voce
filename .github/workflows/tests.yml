@@ -1,0 +1,28 @@
+name: Tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Backend dependencies (Piper is simulated in unit tests)
+        run: |
+          sed '/^piper-tts==/d' backend/requirements.txt > /tmp/backend-tests.txt
+          python -m pip install -r /tmp/backend-tests.txt httpx==0.27.2 pytest==8.3.3
+      - run: python -m pytest tests -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:frontend

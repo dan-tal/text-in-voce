@@ -1,11 +1,13 @@
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 import urllib.request
 import wave
@@ -25,6 +27,7 @@ from piper import PiperVoice
 from pydantic import BaseModel, Field
 import library
 import remarks
+import jobs
 
 BASE_DIR = Path(__file__).parent
 MODELS_DIR = BASE_DIR / "models"
@@ -56,8 +59,12 @@ async def lifespan(app: FastAPI):
     pool = ThreadPoolExecutor(max_workers=PROCESSING_WORKERS, thread_name_prefix="document")
     app.state.processing_pool = pool
     app.state.pending_documents = 0
+    app.state.job_futures = set()
+    app.state.upload_ids = set()
     try:
-        await asyncio.get_running_loop().run_in_executor(pool, get_voice)
+        await asyncio.to_thread(jobs.recover, AUDIO_DIR)
+        # Lazy loading keeps HTTP and saved documents available during a model
+        # download failure; the affected job reports the error instead.
         yield
     finally:
         await asyncio.to_thread(pool.shutdown, wait=True)
@@ -389,8 +396,42 @@ def extract_blocks(filename: str, content: bytes, metadata: dict | None = None) 
     raise HTTPException(400, f"Format neacceptat: {suffix}. Folosește .docx, .pdf sau .txt.")
 
 
+@app.post("/api/jobs", status_code=202)
+async def create_job(response: Response, file: UploadFile = File(...),
+                     request_id: str | None = Form(None, pattern=r"^[0-9a-f]{32}$")):
+    if request_id in app.state.upload_ids:
+        await file.close()
+        raise HTTPException(409, "Încărcarea este deja în curs.", headers={"Retry-After": "2"})
+    if request_id:
+        app.state.upload_ids.add(request_id)
+    try:
+        data = await asyncio.to_thread(jobs.read, AUDIO_DIR, request_id) if request_id else None
+        if data is None:
+            data = await submit_upload(file, background=True, request_id=request_id)
+    finally:
+        app.state.upload_ids.discard(request_id)
+        await file.close()
+    response.headers["Location"] = f'/api/jobs/{data["job_id"]}'
+    response.headers["Cache-Control"] = "no-store"
+    return data
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str, response: Response):
+    data = jobs.read(AUDIO_DIR, job_id)
+    if data is None:
+        raise HTTPException(404, "Procesarea nu mai este disponibilă. Încarcă din nou documentul.")
+    response.headers["Cache-Control"] = "no-store"
+    return data
+
+
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
+    # Compatibility for existing API clients. The web UI uses /api/jobs.
+    return await submit_upload(file, background=False)
+
+
+async def submit_upload(file: UploadFile, background: bool, request_id=None):
     filename = file.filename or ""
     if Path(filename).suffix.lower() not in {".txt", ".pdf", ".docx"}:
         await file.close()
@@ -407,18 +448,25 @@ async def upload(file: UploadFile = File(...)):
         content = await file.read(MAX_UPLOAD_BYTES + 1)
         if len(content) > MAX_UPLOAD_BYTES:
             raise HTTPException(413, f"Fișierul depășește limita de {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
+        job = await asyncio.to_thread(jobs.create, AUDIO_DIR,
+                                    Path(filename.replace("\\", "/")).name[:250], request_id) if background else None
         future = asyncio.get_running_loop().run_in_executor(
-            app.state.processing_pool, process_document, filename, content
+            app.state.processing_pool, run_job if background else process_document,
+            *([job["job_id"], filename, content] if background else [filename, content])
         )
         submitted = True
+        app.state.job_futures.add(future)
 
         def completed(job):
             app.state.pending_documents -= 1
+            app.state.job_futures.discard(job)
             # Retrieve errors even if the HTTP client has disconnected.
             if not job.cancelled():
                 job.exception()
 
         future.add_done_callback(completed)
+        if background:
+            return job
         # Client cancellation must not free a slot while its thread still runs.
         return await asyncio.shield(future)
     finally:
@@ -427,7 +475,33 @@ async def upload(file: UploadFile = File(...)):
         await file.close()
 
 
-def process_document(filename: str, content: bytes) -> dict:
+def run_job(job_id: str, filename: str, content: bytes):
+    last_update = 0
+    last_stage = None
+
+    def progress(stage, completed=0, total=0):
+        nonlocal last_update, last_stage
+        now = time.monotonic()
+        if stage != last_stage or completed == total or now - last_update >= 1:
+            jobs.update(AUDIO_DIR, job_id, status="processing", stage=stage,
+                        completed_sentences=completed, total_sentences=total)
+            last_update, last_stage = now, stage
+
+    try:
+        result = process_document(filename, content, progress)
+        jobs.update(AUDIO_DIR, job_id, status="ready", stage="ready",
+                    session_id=result["session_id"], completed_sentences=len(result["sentences"]),
+                    total_sentences=len(result["sentences"]))
+    except Exception as exc:
+        logger.exception("Background document failed: %s", job_id)
+        jobs.update(AUDIO_DIR, job_id, status="failed",
+                    error_status=exc.status_code if isinstance(exc, HTTPException) else 500,
+                    error=exc.detail if isinstance(exc, HTTPException) else "Generarea audio a eșuat. Reîncearcă mai târziu.")
+
+
+def process_document(filename: str, content: bytes, progress=None) -> dict:
+    if progress:
+        progress("extracting")
     metadata = {}
     try:
         raw_blocks = extract_blocks(filename, content, metadata)
@@ -439,7 +513,13 @@ def process_document(filename: str, content: bytes) -> dict:
     if not raw_blocks:
         raise HTTPException(400, "Nu s-a găsit text în fișier.")
 
-    voice = get_voice()
+    if progress:
+        progress("preparing")
+    try:
+        voice = get_voice()
+    except Exception as exc:
+        logger.exception("Voice initialization failed")
+        raise HTTPException(503, "Vocea nu este disponibilă. Reîncearcă mai târziu.") from exc
     session_id = uuid.uuid4().hex[:12]
     session_dir = AUDIO_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -447,7 +527,7 @@ def process_document(filename: str, content: bytes) -> dict:
     try:
         result = _synthesize_document(raw_blocks, voice, session_id, session_dir,
                                     content if Path(filename).suffix.lower() == ".pdf" else None,
-                                    metadata.get("page_count"), filename)
+                                    metadata.get("page_count"), filename, progress)
         library.register(AUDIO_DIR, result)
         return result
     except Exception as exc:
@@ -460,12 +540,15 @@ def process_document(filename: str, content: bytes) -> dict:
 
 def _synthesize_document(raw_blocks: list[dict], voice: PiperVoice,
                          session_id: str, session_dir: Path, original_pdf: bytes | None = None,
-                         page_count: int | None = None, filename: str = "") -> dict:
+                         page_count: int | None = None, filename: str = "", progress=None) -> dict:
     sentences = []
     blocks = []
     global_index = 0
-    for raw_block in raw_blocks:
-        block_sentences = split_styled_sentences(raw_block["runs"])
+    prepared = [(block, split_styled_sentences(block["runs"])) for block in raw_blocks]
+    total = sum(len(items) for _, items in prepared)
+    if progress:
+        progress("synthesizing", 0, total)
+    for raw_block, block_sentences in prepared:
         if not block_sentences:
             continue
 
@@ -491,6 +574,8 @@ def _synthesize_document(raw_blocks: list[dict], voice: PiperVoice,
             sentences.append(entry)
             indices.append(global_index)
             global_index += 1
+            if progress:
+                progress("synthesizing", global_index, total)
 
         block_out = {"type": raw_block["type"], "sentence_indices": indices}
         if raw_block.get("level"):
@@ -502,6 +587,8 @@ def _synthesize_document(raw_blocks: list[dict], voice: PiperVoice,
     if not sentences:
         raise HTTPException(400, "Nu s-a găsit text în fișier.")
 
+    if progress:
+        progress("exporting", global_index, total)
     mp3_url = _build_mp3(session_dir, len(sentences))
 
     original_url = None
@@ -586,8 +673,8 @@ async def add_remark(session_id: str, audio: UploadFile = File(...),
                      sentence_index: int = Form(..., ge=0),
                      duration: float | None = Form(None, ge=0, le=3600),
                      author: str = Form("", max_length=60)):
-    directory = _document_dir(session_id)
     try:
+        directory = _document_dir(session_id)
         extension = remarks.extension_for(audio.content_type)
         if extension is None:
             raise HTTPException(415, "Format audio neacceptat pentru remarcă.")
@@ -648,12 +735,31 @@ def _build_mp3(session_dir: Path, sentence_count: int) -> str | None:
     return f"/audio/{session_dir.name}/full.mp3"
 
 
+mimetypes.add_type("application/manifest+json", ".webmanifest")
+
+# Generated audio never changes once written (ids are random), so phones may keep
+# it and avoid downloading the same sentence again on replay or seek.
+CACHEABLE_AUDIO = {".wav", ".mp3", ".webm", ".ogg", ".m4a", ".aac"}
+
+
 class AudioFiles(StaticFiles):
     async def get_response(self, path, scope):
         if any(part.startswith(".") for part in path.replace("\\", "/").split("/")):
             raise HTTPException(404, "Fișier negăsit.")
-        return await super().get_response(path, scope)
+        response = await super().get_response(path, scope)
+        if response.status_code in (200, 206) and Path(path).suffix.lower() in CACHEABLE_AUDIO:
+            response.headers["Cache-Control"] = "public, max-age=86400"
+        return response
+
+
+class FrontendFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        # Revalidate on every load (cheap 304 via ETag) so a phone that kept the
+        # page open never mixes a new index.html with an old script.js.
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 app.mount("/audio", AudioFiles(directory=str(AUDIO_DIR)), name="audio")
-app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+app.mount("/", FrontendFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

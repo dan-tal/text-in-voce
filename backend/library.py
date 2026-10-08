@@ -121,5 +121,9 @@ def delete(root, session_id):
                 trash.replace(directory)
             raise
         if trash.exists():
-            shutil.rmtree(trash)
+            try:
+                shutil.rmtree(trash)
+            except OSError:
+                # Public deletion has succeeded. Cleanup is retried by listing.
+                logger.warning("Could not finish deleting %s", session_id, exc_info=True)
     return True

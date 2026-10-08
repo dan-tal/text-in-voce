@@ -9,11 +9,15 @@ const html = fs.readFileSync(path.join(root, "frontend/index.html"), "utf8");
 const css = fs.readFileSync(path.join(root, "frontend/style.css"), "utf8");
 const script = fs.readFileSync(path.join(root, "frontend/script.js"), "utf8");
 
-async function setup(t, query = "") {
+// A phone: touch input (pointer: coarse, hover: none) and the layout viewport of the meta tag.
+const phone = { viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true };
+
+// `init` runs in the page before script.js, to stub browser APIs the app feature-detects.
+async function setup(t, query = "", { device = {}, init } = {}) {
   const browser = await chromium.launch({ headless: true,
     ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : {}) });
   t.after(() => browser.close());
-  const page = await browser.newPage();
+  const page = await (await browser.newContext(device)).newPage();
   await page.route("http://test/**", (route) => new URL(route.request().url()).pathname === "/style.css" ?
     route.fulfill({ contentType: "text/css", body: css }) :
     route.fulfill({ contentType: "text/html", body: html.replace(/<script[^>]*>[\s\S]*?<\/script>/g, "") }));
@@ -21,6 +25,7 @@ async function setup(t, query = "") {
   await page.evaluate(() => {
     window.pendingRequests = [];
     window.sessionResponses = {};
+    window.jobResponses = {};
     window.remarkItems = [];
     window.fetch = (url, options = {}) => {
       if (url.endsWith("/remarks") && !options.method) return Promise.resolve({ ok: true, json: async () => ({ remarks: window.remarkItems }) });
@@ -36,15 +41,23 @@ async function setup(t, query = "") {
       }
       if (url.startsWith("/api/library/") && options.method === "DELETE") return Promise.resolve({ ok: true, status: 204 });
       if (window.sessionResponses[url]) return Promise.resolve({ ok: true, json: async () => window.sessionResponses[url] });
-      return new Promise((resolve) => window.pendingRequests.push({ url, options, resolve }));
+      if (window.jobResponses[url]) return Promise.resolve({ ok: true, json: async () => window.jobResponses[url] });
+      return new Promise((resolve, reject) => window.pendingRequests.push({ url, options, resolve, reject }));
     };
     window.Audio = class {
-      constructor() { window.testAudio = this; this.listeners = {}; this.duration = 1; }
+      // The first element is the player; later ones (next-sentence preload, remark playback) are helpers.
+      constructor() {
+        window.audioInstances = [...(window.audioInstances || []), this];
+        window.testAudio ||= this;
+        this.listeners = {};
+        this.duration = 1;
+      }
       addEventListener(type, fn) { this.listeners[type] = fn; }
       pause() { this.paused = true; }
       play() { return Promise.resolve(); }
     };
   });
+  if (init) await page.evaluate(init);
   await page.addScriptTag({ content: script });
   return page;
 }
@@ -62,7 +75,12 @@ async function submit(page, names) {
 async function resolve(page, index, id, data = session(id)) {
   await page.evaluate(({ index, id, data }) => {
     window.sessionResponses[`/api/session/${id}`] = data;
-    window.pendingRequests[index].resolve({ ok: true, status: 200, json: async () => data });
+    const request = window.pendingRequests[index];
+    if (request.url === "/api/jobs") {
+      const jobId = request.options.body.get("request_id");
+      window.jobResponses[`/api/jobs/${jobId}`] = { status: "ready", session_id: id };
+      request.resolve({ ok: true, status: 202, json: async () => ({ job_id: jobId }) });
+    } else request.resolve({ ok: true, status: 200, json: async () => data });
   }, { index, id, data });
 }
 
@@ -348,4 +366,437 @@ test("no text is white-on-white or otherwise unreadable in any state", async (t)
   assert.deepEqual(await unreadableText(page), [], "recent document row");
   await page.locator(".recent-document-row").getByRole("button", { name: "Șterge" }).click();
   assert.deepEqual(await unreadableText(page), [], "delete confirmation");
+});
+
+// ---------------------------------------------------------------- phone behaviour
+
+const micStubs = () => {
+  window.stopped = false;
+  Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: {
+    getUserMedia: async () => ({ getTracks: () => [{ stop() { window.stopped = true; } }] }),
+  } });
+  window.MediaRecorder = class {
+    static isTypeSupported() { return true; }
+    constructor() { this.state = "inactive"; this.mimeType = "audio/webm"; this.handlers = {}; }
+    addEventListener(type, handler) { this.handlers[type] = handler; }
+    start() { this.state = "recording"; }
+    stop() { this.state = "inactive"; this.handlers.dataavailable({ data: new Blob(["v"]) }); this.handlers.stop(); }
+  };
+};
+
+// Tall enough that the page can scroll.
+function longDocument() {
+  return { session_id: "cccccc", mp3_url: "/cccccc.mp3",
+    sentences: Array.from({ length: 40 }, (_, index) => ({ index, text: `Paragraful numărul ${index} are puțin text.`, duration: 1, audio_url: `/${index}.wav` })),
+    blocks: Array.from({ length: 40 }, (_, index) => ({ type: "paragraph", sentence_indices: [index] })) };
+}
+
+const longWords = { ...twoParagraphs, filename: "Raport.docx",
+  sentences: twoParagraphs.sentences.map((sentence, index) => index === 0 ? { ...sentence,
+    text: "Vezi https://exemplu.ro/un/drum/foarte/lung/care/nu/are/spatii/si/continua/mult/mult/mult/mai/departe/document-final.pdf acum." } : sentence) };
+
+test("page metadata is set up for phones: viewport, no phone-number links, installable app", () => {
+  assert.match(html, /<meta name="viewport"[^>]*viewport-fit=cover/);
+  assert.match(html, /<meta name="viewport"[^>]*interactive-widget=resizes-content/);   // keyboard must not cover the bottom bar
+  assert.match(html, /<meta name="format-detection" content="telephone=no/);           // iOS: digits in text are not phone links
+  assert.match(html, /<link rel="manifest" href="manifest.webmanifest">/);
+  assert.match(html, /<link rel="apple-touch-icon" href="icons\/apple-touch-icon.png">/);
+  assert.match(html, /name="apple-mobile-web-app-capable"/);
+  assert.match(html, /id="file-input" accept="[^"]*application\/pdf[^"]*text\/plain[^"]*wordprocessingml/);   // Android pickers need MIME types
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "frontend/manifest.webmanifest"), "utf8"));
+  assert.equal(manifest.display, "standalone");
+  assert.equal(manifest.start_url, "/");
+  for (const size of [192, 512]) {
+    const icon = manifest.icons.find((entry) => entry.sizes === `${size}x${size}`);
+    assert.ok(icon, `icon ${size}`);
+    const png = fs.readFileSync(path.join(root, "frontend", icon.src));
+    assert.equal(png.readUInt32BE(16), size);          // IHDR width
+    assert.equal(png.readUInt32BE(20), size);          // IHDR height
+  }
+  const touch = fs.readFileSync(path.join(root, "frontend/icons/apple-touch-icon.png"));
+  assert.equal(touch.readUInt32BE(16), 180);
+});
+
+test("phone widths never scroll sideways, even with a very long web address in the text", async (t) => {
+  for (const [width, height] of [[320, 568], [360, 740], [390, 844], [740, 360]]) {
+    const page = await setup(t, "?s=cccccc", { device: { ...phone, viewport: { width, height } } });
+    const overflow = () => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    assert.equal(await overflow(), 0, `${width}px upload screen`);
+    await openShared(page, longWords);
+    await page.waitForSelector("#text-container .remark-row");
+    assert.equal(await overflow(), 0, `${width}px reader`);
+    const bar = await page.locator("#player-bar").boundingBox();
+    assert.ok(bar.x >= 0 && bar.x + bar.width <= width + 0.5, `${width}px bar fits`);
+    for (const button of await page.locator("#player-bar button").all()) {
+      const box = await button.boundingBox();
+      assert.ok(box.x >= 0 && box.x + box.width <= width + 0.5, `${width}px bar button fits`);
+    }
+  }
+});
+
+test("every control is at least 44px for a thumb; hover-only text and the clipboard hint are gone", async (t) => {
+  for (const [width, height] of [[390, 844], [740, 360]]) {        // portrait and sideways (wider than the 600px phone breakpoint)
+    const page = await setup(t, "", { device: { ...phone, viewport: { width, height } } });
+    assert.equal(await page.evaluate(() => matchMedia("(hover: none)").matches && matchMedia("(pointer: coarse)").matches), true);
+    assert.equal(await page.locator(".desktop-only").isHidden(), true);              // "press Ctrl+V" means nothing on a phone
+    await submit(page, ["one.txt"]);
+    await resolve(page, 0, "cccccc", { ...twoParagraphs, filename: "one.txt" });
+    await page.waitForFunction(() => !document.querySelector("#player-section").hidden);
+    await page.evaluate(() => { window.remarkItems = [{ id: "r1", sentence_index: 1, audio_url: "/a.webm", duration: 12, author: "Ana" }]; loadRemarks(); });
+    await page.waitForSelector(".remark-chip");
+    const small = await page.evaluate(() => [...document.querySelectorAll("button, a.download-link, input:not([type=file]):not([type=hidden])")]
+      .filter((el) => !el.closest("[hidden]") && el.getClientRects().length)
+      .map((el) => ({ name: el.id || el.className || el.tagName, ...(({ width, height }) => ({ width, height }))(el.getBoundingClientRect()) }))
+      .filter((el) => el.width < 43.5 || el.height < 43.5)
+      .map((el) => `${el.name} ${Math.round(el.width)}x${Math.round(el.height)}`));
+    assert.deepEqual(small, [], `${width}x${height}`);
+  }
+});
+
+test("opening a document brings the text into view instead of leaving the upload card on screen", async (t) => {
+  const page = await setup(t, "", { device: phone });
+  await submit(page, ["one.txt"]);
+  await resolve(page, 0, "cccccc", { ...longDocument(), filename: "one.txt" });
+  await page.waitForFunction(() => !document.querySelector("#player-section").hidden);
+  await page.waitForFunction(() => document.querySelector("#player-section").getBoundingClientRect().top < 4);
+  const top = await page.evaluate(() => document.querySelector("#player-section").getBoundingClientRect().top);
+  assert.ok(Math.abs(top) < 4, `reader starts at the top of the screen (${top})`);
+});
+
+test("the footer stays readable above the fixed bottom bar at the end of a long page", async (t) => {
+  const page = await setup(t, "?s=cccccc", { device: phone });
+  await openShared(page, longDocument());
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  const { footer, bar } = await page.evaluate(() => {
+    const text = document.createRange();
+    text.selectNodeContents(document.querySelector("footer"));       // the text line, not the padding around it
+    return { footer: text.getBoundingClientRect().bottom, bar: document.querySelector("#player-bar").getBoundingClientRect().top };
+  });
+  assert.ok(footer <= bar + 0.5, `footer text (${footer}) clears the bar (${bar})`);
+});
+
+test("lock screen and headset controls drive the reader", async (t) => {
+  const page = await setup(t, "?s=cccccc", { init: () => {
+    window.mediaHandlers = {};
+    navigator.mediaSession.setActionHandler = (action, handler) => { window.mediaHandlers[action] = handler; };
+  } });
+  await openShared(page, { ...twoParagraphs, filename: "Raport.docx" });
+  assert.deepEqual(await page.evaluate(() => Object.keys(window.mediaHandlers).sort()),
+    ["nexttrack", "pause", "play", "previoustrack", "seekbackward", "seekforward", "stop"]);
+  const audioSrc = () => page.evaluate(() => window.testAudio.src);
+
+  await page.evaluate(() => window.mediaHandlers.play());
+  assert.equal(await audioSrc(), "/audio/cccccc/0.wav");
+  assert.equal(await page.evaluate(() => navigator.mediaSession.playbackState), "playing");
+  assert.equal(await page.evaluate(() => navigator.mediaSession.metadata.title), "Raport.docx");
+  assert.match(await page.evaluate(() => navigator.mediaSession.metadata.artwork[0].src), /\/icons\/icon-192\.png$/);
+  await page.evaluate(() => window.mediaHandlers.nexttrack());
+  assert.equal(await audioSrc(), "/audio/cccccc/1.wav");
+  await page.evaluate(() => { window.testAudio.currentTime = 5; window.mediaHandlers.previoustrack(); });   // mid-sentence: restart it
+  assert.equal(await audioSrc(), "/audio/cccccc/1.wav");
+  assert.equal(await page.evaluate(() => window.testAudio.currentTime), 0);
+  await page.evaluate(() => window.mediaHandlers.previoustrack());                                             // at its start: go back
+  assert.equal(await audioSrc(), "/audio/cccccc/0.wav");
+  await page.evaluate(() => window.mediaHandlers.previoustrack());                                             // nothing before the first sentence
+  assert.equal(await audioSrc(), "/audio/cccccc/0.wav");
+  await page.evaluate(() => window.mediaHandlers.pause());
+  assert.equal(await page.evaluate(() => navigator.mediaSession.playbackState), "paused");
+  assert.equal(await page.evaluate(() => window.testAudio.paused), true);
+});
+
+test("the next sentence is fetched ahead so a slow connection leaves no gap", async (t) => {
+  const page = await setup(t, "?s=cccccc");
+  await openShared(page, twoParagraphs);
+  await page.locator('[data-index="0"]').click();
+  assert.equal(await page.evaluate(() => window.audioInstances.length), 2);
+  assert.equal(await page.evaluate(() => window.audioInstances[0].src), "/audio/cccccc/0.wav");   // playback stays on one element
+  assert.equal(await page.evaluate(() => window.audioInstances[1].src), "/audio/cccccc/1.wav");
+  assert.equal(await page.evaluate(() => window.audioInstances[1].preload), "auto");
+  await page.evaluate(() => window.testAudio.listeners.ended());
+  assert.equal(await page.evaluate(() => window.audioInstances[0].src), "/audio/cccccc/1.wav");
+  assert.equal(await page.evaluate(() => window.audioInstances[1].src), "/audio/cccccc/2.wav");
+  await page.locator('[data-index="2"]').click();                                                  // last sentence: nothing further to fetch
+  assert.equal(await page.evaluate(() => window.audioInstances[1].src), "/audio/cccccc/2.wav");
+});
+
+test("a dropped connection while a sentence loads is reported and Play reloads it", async (t) => {
+  const page = await setup(t, "?s=cccccc");
+  await openShared(page, twoParagraphs);
+  await page.locator('[data-index="1"]').click();
+  await page.evaluate(() => { window.testAudio.error = { code: 2 }; window.testAudio.listeners.error(); });
+  assert.equal(await page.locator("#play-btn").textContent(), "▶");
+  assert.match(await page.locator("#status").textContent(), /Conexiune slabă/);
+  await page.evaluate(() => { window.testAudio.src = ""; });
+  await page.locator("#play-btn").click();
+  assert.equal(await page.evaluate(() => window.testAudio.src), "/audio/cccccc/1.wav");          // reloaded, not merely resumed
+  assert.equal(await page.locator("#play-btn").textContent(), "⏸");
+});
+
+test("Share opens the phone's share sheet and falls back to copying the link", async (t) => {
+  const page = await setup(t, "", { device: phone, init: () => {
+    window.shares = [];
+    window.copied = [];
+    navigator.share = async (data) => { window.shares.push(data); };
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text) => { window.copied.push(text); } } });
+  } });
+  await submit(page, ["one.txt"]);
+  await resolve(page, 0, "cccccc", { ...twoParagraphs, filename: "Raport.docx" });
+  await page.waitForFunction(() => !document.querySelector("#player-section").hidden);
+
+  await page.locator("#share-btn").click();
+  const shared = await page.evaluate(() => window.shares[0]);
+  assert.equal(shared.title, "Raport.docx");
+  assert.match(shared.url, /\?s=cccccc/);
+  assert.deepEqual(await page.evaluate(() => window.copied), []);
+
+  await page.evaluate(() => { navigator.share = async () => { const error = new Error("closed"); error.name = "AbortError"; throw error; }; });
+  await page.locator("#share-btn").click();                                                         // closing the sheet is not an error
+  assert.deepEqual(await page.evaluate(() => window.copied), []);
+  assert.equal(await page.locator("#share-btn").textContent(), "🔗 Partajează");
+
+  await page.evaluate(() => { navigator.share = async () => { throw new Error("unsupported"); }; });
+  await page.locator("#share-btn").click();
+  assert.match(await page.evaluate(() => window.copied[0]), /\?s=cccccc/);
+  assert.match(await page.locator("#share-btn").textContent(), /Link copiat/);
+});
+
+test("Share copies the link on a computer without calling the share sheet", async (t) => {
+  const page = await setup(t, "", { init: () => {
+    window.shares = [];
+    navigator.share = async (data) => { window.shares.push(data); };
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text) => { window.copied = text; } } });
+  } });
+  await submit(page, ["one.txt"]);
+  await resolve(page, 0, "cccccc", twoParagraphs);
+  await page.waitForFunction(() => !document.querySelector("#player-section").hidden);
+  await page.locator("#share-btn").click();
+  await page.waitForFunction(() => window.copied);
+  assert.deepEqual(await page.evaluate(() => window.shares), []);
+});
+
+test("copying works without the clipboard API (a plain-http server)", async (t) => {
+  const page = await setup(t, "", { init: () => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
+    window.legacyCopies = [];
+    document.execCommand = (command) => { window.legacyCopies.push([command, document.activeElement.value]); return true; };
+  } });
+  await submit(page, ["one.txt"]);
+  await resolve(page, 0, "cccccc", twoParagraphs);
+  await page.waitForFunction(() => !document.querySelector("#player-section").hidden);
+  await page.locator("#share-btn").click();
+  assert.match(await page.locator("#share-btn").textContent(), /Link copiat/);
+  const [command, value] = await page.evaluate(() => window.legacyCopies[0]);
+  assert.equal(command, "copy");
+  assert.match(value, /\?s=cccccc/);
+});
+
+test("the Back gesture closes the voice-note sheet instead of leaving the page", async (t) => {
+  const page = await setup(t, "?s=cccccc", { init: micStubs });
+  await openShared(page, twoParagraphs);
+  await page.waitForSelector("#text-container .remark-row");
+  const entries = await page.evaluate(() => history.length);
+
+  await page.locator("#remark-dock-btn").click();
+  await page.waitForSelector("#remark-stop", { state: "visible" });
+  assert.equal(await page.evaluate(() => history.length), entries + 1);
+  await page.goBack();                                                  // Android Back / iOS edge swipe
+  await page.waitForSelector("#remark-sheet", { state: "hidden" });
+  assert.equal(await page.evaluate(() => window.stopped), true);        // microphone released
+  assert.equal(await page.evaluate(() => window.savedRemark), undefined);
+  assert.match(page.url(), /s=cccccc/);                                 // still on the document
+  assert.equal(await page.locator("#player-section").isVisible(), true);
+
+  // Closing with the button gives the history entry back; Back then leaves nothing stale behind.
+  await page.locator("#remark-dock-btn").click();
+  await page.waitForSelector("#remark-stop", { state: "visible" });
+  await page.locator("#remark-stop").click();
+  await page.waitForSelector("#remark-save", { state: "visible" });
+  await page.locator("#remark-cancel").click();
+  await page.waitForFunction(() => !history.state?.remarkSheet);
+  assert.equal(await page.locator("#remark-sheet").isHidden(), true);
+});
+
+test("Redo keeps a single history entry for the sheet", async (t) => {
+  const page = await setup(t, "?s=cccccc", { init: micStubs });
+  await openShared(page, twoParagraphs);
+  await page.waitForSelector("#text-container .remark-row");
+  await page.locator("#remark-dock-btn").click();
+  await page.locator("#remark-stop").click();
+  await page.waitForSelector("#remark-save", { state: "visible" });
+  const entries = await page.evaluate(() => history.length);
+  await page.locator("#remark-redo").click();
+  await page.waitForSelector("#remark-stop", { state: "visible" });
+  assert.equal(await page.evaluate(() => history.length), entries);
+  await page.goBack();
+  await page.waitForSelector("#remark-sheet", { state: "hidden" });
+  assert.match(page.url(), /s=cccccc/);
+});
+
+test("pages can be turned from the end of the text, and a short document shows no pager", async (t) => {
+  const page = await setup(t, "?s=pppppp");
+  const pages = { session_id: "pppppp", sentences: [1, 2, 3].map((n) => ({ index: n - 1, text: `Pagina ${n}.`, page: n, duration: 1, audio_url: `/${n}.wav` })),
+    blocks: [1, 2, 3].map((n) => ({ type: "paragraph", sentence_indices: [n - 1] })), page_count: 3, original_url: "/audio/pppppp/original.pdf" };
+  await openShared(page, pages);
+  assert.equal(await page.locator("#page-end-nav").isVisible(), true);
+  assert.equal(await page.locator("#end-prev").isDisabled(), true);
+  await page.locator("#end-next").click();
+  assert.equal(await page.locator("#page-input").inputValue(), "2");
+  assert.match(await page.locator("#text-container").textContent(), /Pagina 2/);
+  await page.locator("#end-next").click();
+  assert.equal(await page.locator("#end-next").isDisabled(), true);
+  await page.locator("#end-prev").click();
+  assert.equal(await page.locator("#page-input").inputValue(), "2");
+
+  const single = await setup(t, "?s=cccccc");
+  await openShared(single, twoParagraphs);
+  assert.equal(await single.locator("#page-end-nav").isHidden(), true);
+});
+
+test("the screen is held awake while a document is being generated and released afterwards", async (t) => {
+  const page = await setup(t, "", { init: () => {
+    window.locks = [];
+    Object.defineProperty(navigator, "wakeLock", { configurable: true, value: { request: async () => {
+      const lock = { released: false, release: async () => { lock.released = true; }, addEventListener() {} };
+      window.locks.push(lock);
+      return lock;
+    } } });
+  } });
+  await submit(page, ["one.txt", "two.txt"]);
+  await page.waitForFunction(() => window.locks.length === 1);
+  assert.equal(await page.evaluate(() => window.locks[0].released), false);
+  await resolve(page, 0, "aaaaaa");
+  await page.waitForFunction(() => document.querySelector("#status").textContent.startsWith("1 gata"));
+  assert.equal(await page.evaluate(() => window.locks.length), 1);                                  // one lock covers both uploads
+  assert.equal(await page.evaluate(() => window.locks[0].released), false);                         // the second is still running
+  await resolve(page, 1, "bbbbbb");
+  await page.waitForFunction(() => window.locks[0].released);
+});
+
+test("a lost connection during generation says so and offers a retry", async (t) => {
+  const page = await setup(t);
+  await submit(page, ["one.txt"]);
+  await page.evaluate(() => window.pendingRequests[0].reject(new TypeError("Failed to fetch")));
+  await page.waitForFunction(() => document.querySelector(".recent-document-row .document-status").textContent.includes("Conexiunea s-a întrerupt"));
+  assert.equal(await page.locator(".recent-document-row").getByRole("button", { name: "Reîncearcă" }).isEnabled(), true);
+});
+
+test("accepted jobs show progress and fetch the session only after completion", async (t) => {
+  const page = await setup(t);
+  await submit(page, ["one.txt"]);
+  await page.evaluate(() => {
+    const request = window.pendingRequests[0];
+    const id = request.options.body.get("request_id");
+    window.currentJobId = id;
+    window.jobResponses[`/api/jobs/${id}`] = { status: "processing", stage: "synthesizing", completed_sentences: 1, total_sentences: 10 };
+    request.resolve({ ok: true, status: 202, json: async () => ({ job_id: id }) });
+  });
+  await page.waitForFunction(() => document.querySelector(".document-status").textContent.includes("1 / 10"));
+  assert.equal(await page.locator("#player-section").isHidden(), true);
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("text-in-voce-pending-jobs"))[0].jobId),
+    await page.evaluate(() => window.currentJobId));
+  await page.evaluate((data) => {
+    window.sessionResponses["/api/session/aaaaaa"] = data;
+    window.jobResponses[`/api/jobs/${window.currentJobId}`] = { status: "ready", session_id: "aaaaaa" };
+  }, session("aaaaaa"));
+  await page.waitForFunction(() => document.querySelector("#status").textContent.startsWith("1 gata"));
+  assert.equal(await page.evaluate(() => window.pendingRequests.filter((r) => r.options.method === "POST").length), 1);
+  assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem("text-in-voce-pending-jobs"))), []);
+});
+
+test("a temporary 524 while polling is retried without uploading the document again", async (t) => {
+  const page = await setup(t, "", { init: () => {
+    const fetch = window.fetch;
+    window.failedPoll = false;
+    window.fetch = (url, options) => {
+      if (url.startsWith("/api/jobs/") && !window.failedPoll) {
+        window.failedPoll = true;
+        return Promise.resolve({ ok: false, status: 524, json: async () => ({}) });
+      }
+      return fetch(url, options);
+    };
+  } });
+  await submit(page, ["one.txt"]);
+  await resolve(page, 0, "aaaaaa");
+  await page.waitForFunction(() => document.querySelector(".document-status").textContent.includes("se reia automat"));
+  await page.waitForFunction(() => document.querySelector("#status").textContent.startsWith("1 gata"));
+  assert.equal(await page.evaluate(() => window.pendingRequests.length), 1);
+});
+
+test("a failed background job offers a fresh retry instead of polling the failed id forever", async (t) => {
+  const page = await setup(t);
+  await submit(page, ["one.txt"]);
+  const oldId = await page.evaluate(() => {
+    const request = window.pendingRequests[0];
+    const id = request.options.body.get("request_id");
+    window.jobResponses[`/api/jobs/${id}`] = { status: "failed", error: "Fișierul nu poate fi citit." };
+    request.resolve({ ok: true, status: 202, json: async () => ({ job_id: id }) });
+    return id;
+  });
+  await page.waitForFunction(() => document.querySelector(".document-status").textContent.includes("nu poate fi citit"));
+  await page.getByRole("button", { name: "Reîncearcă", exact: true }).click();
+  await page.waitForFunction(() => window.pendingRequests.length === 2);
+  assert.notEqual(await page.evaluate(() => window.pendingRequests[1].options.body.get("request_id")), oldId);
+  await resolve(page, 1, "aaaaaa");
+  await page.waitForFunction(() => document.querySelector("#status").textContent.startsWith("1 gata"));
+});
+
+test("a lost upload acknowledgement is retried with the same id", async (t) => {
+  const page = await setup(t);
+  await submit(page, ["one.txt"]);
+  const oldId = await page.evaluate(() => {
+    window.pendingRequests[0].reject(new TypeError("network lost"));
+    return window.pendingRequests[0].options.body.get("request_id");
+  });
+  await page.waitForFunction(() => document.querySelector(".document-status").textContent.includes("Conexiunea s-a întrerupt"));
+  await page.getByRole("button", { name: "Reîncearcă", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.pendingRequests[1].options.body.get("request_id")), oldId);
+  await resolve(page, 1, "aaaaaa");
+  await page.waitForFunction(() => document.querySelector("#status").textContent.startsWith("1 gata"));
+});
+
+test("reopening a tab restores pending job ids and does not submit files again", async (t) => {
+  const page = await setup(t, "", { init: () => {
+    const id = "a".repeat(32);
+    localStorage.setItem("text-in-voce-pending-jobs", JSON.stringify([{ name: "one.txt", jobId: id }]));
+    window.jobResponses[`/api/jobs/${id}`] = { status: "ready", session_id: "aaaaaa" };
+    window.sessionResponses["/api/session/aaaaaa"] = { session_id: "aaaaaa", sentences: [{ index: 0, text: "Salut.", audio_url: "/a.wav" }],
+      blocks: [{ type: "paragraph", sentence_indices: [0] }] };
+  } });
+  await page.waitForFunction(() => document.querySelector("#status").textContent.startsWith("1 gata"));
+  assert.equal(await page.evaluate(() => window.pendingRequests.length), 0);
+  assert.equal(await page.locator("#share-btn").isVisible(), true);
+  assert.match(await page.locator("#text-container").textContent(), /Salut/);
+});
+
+test("an unsupported recorder releases the microphone stream", async (t) => {
+  const page = await setup(t, "?s=cccccc", { init: () => {
+    window.stopped = false;
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: {
+      getUserMedia: async () => ({ getTracks: () => [{ stop() { window.stopped = true; } }] }),
+    } });
+    window.MediaRecorder = class {
+      static isTypeSupported() { return true; }
+      constructor() { throw new Error("unsupported recorder"); }
+    };
+  } });
+  await openShared(page, twoParagraphs);
+  await page.locator("#remark-dock-btn").click();
+  await page.waitForFunction(() => window.stopped);
+  assert.match(await page.locator("#status").textContent(), /Nu s-a putut porni/);
+});
+
+test("a microphone permission arriving after a document switch cannot record on the new document", async (t) => {
+  const page = await setup(t, "?s=cccccc", { init: () => {
+    window.stopped = false;
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: {
+      getUserMedia: () => new Promise((resolve) => { window.allowMic = () => resolve({ getTracks: () => [{ stop() { window.stopped = true; } }] }); }),
+    } });
+    window.MediaRecorder = class {};
+  } });
+  await openShared(page, twoParagraphs);
+  await page.locator("#remark-dock-btn").click();
+  await page.evaluate((data) => { applySessionData(data); window.allowMic(); }, session("aaaaaa"));
+  await page.waitForFunction(() => window.stopped);
+  assert.equal(await page.locator("#remark-sheet").isHidden(), true);
+  assert.match(await page.locator("#text-container").textContent(), /aaaaaa/);
 });

@@ -6,8 +6,8 @@ remarks too, and the audio is served by the existing /audio static mount.
 """
 import json
 import re
-import threading
 import uuid
+import library
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,7 +24,8 @@ AUDIO_TYPES = {
     "audio/wav": "wav",
     "audio/x-wav": "wav",
 }
-_lock = threading.Lock()
+# Deleting a document and writing its remarks must use the same lock.
+_lock = library._lock
 
 
 def extension_for(content_type: str | None) -> str | None:
@@ -57,11 +58,11 @@ def list_remarks(directory: Path) -> list[dict]:
 def add(directory: Path, session_id: str, sentence_index: int, content: bytes,
         extension: str, duration: float | None, author: str) -> dict:
     """Store one remark; raises FileNotFoundError if the document was deleted."""
-    if not directory.is_dir():
-        raise FileNotFoundError(directory)
     remark_id = uuid.uuid4().hex[:12]
     audio_dir = directory / "remarks"
     with _lock:
+        if not (directory / "meta.json").is_file():
+            raise FileNotFoundError(directory)
         audio_dir.mkdir(exist_ok=True)
         (audio_dir / f"{remark_id}.{extension}").write_bytes(content)
         item = {
