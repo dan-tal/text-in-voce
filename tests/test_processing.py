@@ -400,3 +400,218 @@ def test_audio_remarks_are_shared_served_validated_and_deleted_with_the_document
             assert (await client.post(path, data={"sentence_index": "0"}, files=wav)).status_code == 404
 
     asyncio.run(scenario())
+
+
+def test_audio_supports_range_requests_for_ios_safari_and_is_cacheable(backend, monkeypatch):
+    # Safari refuses to play (or seek in) <audio> unless the server answers byte ranges with 206.
+    audio_mount = next(route.app for route in main.app.routes if getattr(route, "path", None) == "/audio")
+    monkeypatch.setattr(audio_mount, "all_directories", [str(backend)])
+    session = main.process_document("note.txt", b"Primul paragraf.")
+    wav = f'/audio/{session["session_id"]}/0.wav'
+    total = (backend / session["session_id"] / "0.wav").stat().st_size
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as client:
+            probe = await client.get(wav, headers={"Range": "bytes=0-1"})   # what Safari sends first
+            assert probe.status_code == 206
+            assert probe.headers["content-range"] == f"bytes 0-1/{total}"
+            assert probe.headers["accept-ranges"] == "bytes"
+            assert len(probe.content) == 2
+            tail = await client.get(wav, headers={"Range": "bytes=44-"})
+            assert tail.status_code == 206 and len(tail.content) == total - 44
+            full = await client.get(wav)
+            assert full.status_code == 200 and len(full.content) == total
+            for response in (probe, full):
+                assert response.headers["cache-control"] == "public, max-age=86400"
+            # Mutable bookkeeping files are never cached by phones.
+            meta = await client.get(f'/audio/{session["session_id"]}/meta.json')
+            assert meta.status_code == 200 and "max-age" not in meta.headers.get("cache-control", "")
+            assert (await client.get(f'/audio/{session["session_id"]}/.hidden')).status_code == 404
+
+    asyncio.run(scenario())
+
+
+def test_frontend_is_revalidated_and_installable_on_phones():
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as client:
+            # A phone that kept the tab open must never mix a new page with an old script.
+            for path in ("/", "/script.js", "/style.css", "/manifest.webmanifest"):
+                response = await client.get(path)
+                assert response.status_code == 200, path
+                assert response.headers["cache-control"] == "no-cache", path
+                assert response.headers["etag"], path                        # so revalidation is a cheap 304
+                revalidated = await client.get(path, headers={"If-None-Match": response.headers["etag"]})
+                assert revalidated.status_code == 304, path
+            manifest = await client.get("/manifest.webmanifest")
+            assert manifest.headers["content-type"].startswith("application/manifest+json")
+            icons = manifest.json()["icons"]
+            assert {icon["sizes"] for icon in icons} >= {"192x192", "512x512"}
+            for icon in icons:
+                served = await client.get(icon["src"])
+                assert served.status_code == 200 and served.headers["content-type"] == icon["type"], icon["src"]
+            assert (await client.get("/icons/apple-touch-icon.png")).status_code == 200
+
+    asyncio.run(scenario())
+
+
+def test_jobs_acknowledge_before_synthesis_and_retries_do_not_duplicate(backend, monkeypatch):
+    release = threading.Event()
+    started = threading.Event()
+
+    class SlowVoice(FakeVoice):
+        def synthesize(self, text, wav_file):
+            started.set()
+            assert release.wait(5)
+            super().synthesize(text, wav_file)
+
+    monkeypatch.setattr(main, "get_voice", lambda: SlowVoice())
+    monkeypatch.setattr(main, "MAX_PENDING_DOCUMENTS", 1)
+    job_id = "a" * 32
+
+    async def scenario():
+        async with main.app.router.lifespan_context(main.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as client:
+                try:
+                    response = await asyncio.wait_for(client.post("/api/jobs", data={"request_id": job_id},
+                                                     files={"file": ("one.txt", "Salut. Bună ziua!")}), 1)
+                    assert response.status_code == 202
+                    assert response.headers["location"] == f"/api/jobs/{job_id}"
+                    await wait_until(started.is_set)
+                    polled = await asyncio.wait_for(client.get(response.headers["location"]), 1)
+                    assert polled.headers["cache-control"] == "no-store"
+                    assert polled.json()["status"] == "processing"
+                    assert polled.json()["total_sentences"] == 2
+                    duplicate = await client.post("/api/jobs", data={"request_id": job_id},
+                                                  files={"file": ("one.txt", "Salut. Bună ziua!")})
+                    assert duplicate.json()["job_id"] == job_id
+                    assert main.app.state.pending_documents == 1
+                    assert (await client.post("/api/jobs", files={"file": ("two.txt", "Salut.")})).status_code == 429
+                    assert (await client.get("/")).status_code == 200
+                    assert (await client.get("/api/jobs/invalid")).status_code == 404
+                    assert (await client.get(f"/audio/.jobs/{job_id}.json")).status_code == 404
+                finally:
+                    release.set()
+                await wait_until(lambda: main.app.state.pending_documents == 0)
+                done = (await client.get(f"/api/jobs/{job_id}")).json()
+                assert done["status"] == "ready" and done["completed_sentences"] == 2
+                session = (await client.get(f'/api/session/{done["session_id"]}')).json()
+                assert len(session["sentences"]) == 2
+                assert len(main.get_library()["documents"]) == 1
+        # A tab/server restart can recover completed status without input again.
+        async with main.app.router.lifespan_context(main.app):
+            assert main.jobs.read(backend, job_id)["status"] == "ready"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("filename,content", [("bad.docx", b"broken"), ("empty.txt", b" ")])
+def test_failed_jobs_report_errors_and_release_capacity(backend, filename, content):
+    async def scenario():
+        async with main.app.router.lifespan_context(main.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as client:
+                response = await client.post("/api/jobs", files={"file": (filename, content)})
+                assert response.status_code == 202
+                await wait_until(lambda: main.app.state.pending_documents == 0)
+                data = (await client.get(response.headers["location"])).json()
+                assert data["status"] == "failed" and data["error_status"] == 400
+                assert data["error"]
+                assert not [path for path in backend.iterdir() if not path.name.startswith(".")]
+    asyncio.run(scenario())
+
+
+def test_missing_voice_does_not_prevent_startup_or_expose_engine_details(backend, monkeypatch):
+    def unavailable():
+        raise OSError("private network credentials")
+    monkeypatch.setattr(main, "get_voice", unavailable)
+
+    async def scenario():
+        async with main.app.router.lifespan_context(main.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as client:
+                assert (await client.get("/")).status_code == 200
+                response = await client.post("/api/jobs", files={"file": ("one.txt", "Salut.")})
+                await wait_until(lambda: main.app.state.pending_documents == 0)
+                data = (await client.get(response.headers["location"])).json()
+                assert data["status"] == "failed" and data["error_status"] == 503
+                assert "private" not in data["error"]
+    asyncio.run(scenario())
+
+
+def test_interrupted_jobs_are_marked_failed_and_old_status_records_are_pruned(backend):
+    pending = main.jobs.create(backend, "one.txt")
+    done = main.jobs.create(backend, "two.txt")
+    main.jobs.update(backend, done["job_id"], status="ready")
+    path = backend / ".jobs" / f'{done["job_id"]}.json'
+    data = json.loads(path.read_text())
+    data["updated_at"] = 0
+    path.write_text(json.dumps(data))
+    main.jobs.recover(backend)
+    assert main.jobs.read(backend, pending["job_id"])["status"] == "failed"
+    assert main.jobs.read(backend, done["job_id"]) is None
+
+
+def test_deleted_document_cannot_be_recreated_by_a_late_remark(backend):
+    result = main.process_document("one.txt", b"Salut.")
+    directory = backend / result["session_id"]
+    assert main.library.delete(backend, result["session_id"])
+    with pytest.raises(FileNotFoundError):
+        main.remarks.add(directory, result["session_id"], 0, b"voice", "webm", 1, "")
+    assert not directory.exists()
+
+
+def test_delete_succeeds_even_if_private_disk_cleanup_must_be_retried(backend, monkeypatch):
+    result = main.process_document("one.txt", b"Salut.")
+    original = main.library.shutil.rmtree
+    monkeypatch.setattr(main.library.shutil, "rmtree", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("busy")))
+    assert main.library.delete(backend, result["session_id"])
+    assert not (backend / result["session_id"]).exists()
+    monkeypatch.setattr(main.library.shutil, "rmtree", original)
+    assert main.get_library()["documents"] == []
+    assert not list((backend / ".library").glob("deleted-*"))
+
+
+def test_disconnect_during_status_write_still_enqueues_the_document(backend, monkeypatch):
+    release = threading.Event()
+    started = threading.Event()
+    create = main.jobs.create
+    job_id = "c" * 32
+
+    def slow_create(*args):
+        started.set()
+        assert release.wait(5)
+        return create(*args)
+
+    monkeypatch.setattr(main.jobs, "create", slow_create)
+
+    async def scenario():
+        async with main.app.router.lifespan_context(main.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(main.app), base_url="http://test") as client:
+                request = asyncio.create_task(client.post("/api/jobs", data={"request_id": job_id},
+                                                         files={"file": ("one.txt", "Salut.")}))
+                try:
+                    await wait_until(started.is_set)
+                    request.cancel()
+                    # Let cancellation reach the await of the status write.
+                    await asyncio.sleep(0)
+                    assert main.app.state.pending_documents == 1
+                finally:
+                    release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+                await wait_until(lambda: main.app.state.pending_documents == 0)
+                retry = await client.post("/api/jobs", data={"request_id": job_id},
+                                          files={"file": ("one.txt", "Salut.")})
+                assert retry.status_code == 202 and retry.json()["status"] == "ready"
+                assert len(main.get_library()["documents"]) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("data", [[], {"status": "ready"},
+                                  {"job_id": "d" * 32, "status": [], "updated_at": 0},
+                                  {"job_id": "d" * 32, "status": "ready", "updated_at": "invalid"}])
+def test_corrupt_status_records_do_not_break_recovery_or_polling(backend, data):
+    directory = backend / ".jobs"
+    directory.mkdir()
+    (directory / f'{"d" * 32}.json').write_text(json.dumps(data))
+    main.jobs.recover(backend)
+    assert main.jobs.read(backend, "d" * 32) is None

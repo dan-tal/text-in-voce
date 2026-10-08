@@ -1,1 +1,1 @@
-window.APP_VERSION = '20261007-documente-recente';
+window.APP_VERSION = '20261008-procesare-fundal';

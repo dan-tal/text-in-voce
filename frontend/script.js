@@ -18,6 +18,10 @@ const nextPageBtn = document.getElementById("next-page");
 const pageForm = document.getElementById("page-form");
 const pageInput = document.getElementById("page-input");
 const pageCountEl = document.getElementById("page-count");
+const pageEndNav = document.getElementById("page-end-nav");
+const endPrevBtn = document.getElementById("end-prev");
+const endNextBtn = document.getElementById("end-next");
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 const READER_PAGE_CHARACTERS = 3000;
 let readerPages = [];
 let currentPage = 0;
@@ -39,6 +43,7 @@ let openingDocument = null;
 const documents = [];
 const uploadQueue = [];
 const MAX_PARALLEL_UPLOADS = 2;
+const PENDING_JOBS_KEY = "text-in-voce-pending-jobs";
 let activeUploads = 0;
 let selectionVersion = 0;
 const sentenceElements = new Map();
@@ -51,8 +56,10 @@ const SPEEDS = [0.75, 1, 1.25, 1.5, 2, 3];
 let playbackRate = 1.0;
 let playing = false;
 let currentSessionId = null;
+let currentDocumentName = "";
 let playbackRequest = 0;
 const audio = new Audio();
+const mediaSession = "mediaSession" in navigator ? navigator.mediaSession : null;
 
 const versionEl = document.getElementById("app-version");
 if (versionEl && window.APP_VERSION) {
@@ -117,7 +124,7 @@ function syncRecentDocument(job) {
   view.deleteButton.textContent = job.state === "ready" ? "Șterge" : "Elimină";
   view.deleteButton.title = job.state === "processing" ? "Poți șterge documentul după terminarea procesării" :
     "Șterge definitiv documentul și fișierele audio";
-  view.button.setAttribute("aria-pressed", String(job.sessionId === currentSessionId));
+  view.button.setAttribute("aria-pressed", String(!!job.sessionId && job.sessionId === currentSessionId));
   view.row.classList.toggle("failed", job.state === "failed");
   view.row.classList.toggle("selected", !!job.sessionId && job.sessionId === currentSessionId);
 }
@@ -134,6 +141,7 @@ function activateDocument(job) {
   if (job.disabled || job.removed) return;
   if (job.state === "ready") openDocument(job);
   else if (job.state === "failed") {
+    if (!job.file && !job.jobId) { fileInput.click(); return; }
     job.state = "queued";
     job.statusText = "În așteptare";
     job.disabled = true;
@@ -158,6 +166,15 @@ function readyDocument(job, data) {
   job.buttonText = "Deschide";
   job.disabled = false;
   syncRecentDocument(job);
+  persistPendingJobs();
+}
+
+function persistPendingJobs() {
+  try {
+    localStorage.setItem(PENDING_JOBS_KEY, JSON.stringify(documents
+      .filter((job) => job.jobId && job.state !== "ready" && !job.removed)
+      .map((job) => ({ name: job.name, jobId: job.jobId }))));
+  } catch (error) { /* Private browsing may disable storage. */ }
 }
 
 async function requestJson(url, options) {
@@ -172,6 +189,10 @@ async function requestJson(url, options) {
 }
 
 async function openDocument(job) {
+  if (remarkBusy) {
+    statusEl.textContent = "Salvează sau anulează remarca înainte de a schimba documentul.";
+    return;
+  }
   const version = ++selectionVersion;
   openingDocument = job;
   job.disabled = true;
@@ -200,6 +221,8 @@ function removeDocument(job) {
   if (index >= 0) documents.splice(index, 1);
   if (openingDocument === job) { openingDocument = null; selectionVersion += 1; }
   if (job.sessionId && job.sessionId === currentSessionId) {
+    closeRemark();
+    pendingFileTarget = null;
     selectionVersion += 1;
     stopPlayback();
     currentSessionId = null;
@@ -209,6 +232,8 @@ function removeDocument(job) {
     sentencePages.clear();
     resetRemarks();
     textContainer.replaceChildren();
+    pageEndNav.hidden = true;
+    currentDocumentName = "";
     playerSection.hidden = true;
     downloadLink.removeAttribute("href");
     const url = new URL(window.location.href);
@@ -216,6 +241,7 @@ function removeDocument(job) {
     window.history.replaceState({}, "", url);
   }
   updateUploadStatus();
+  persistPendingJobs();
 }
 
 function confirmDeletion(job) {
@@ -274,30 +300,123 @@ function pumpUploads() {
     processUpload(job);
   }
   updateUploadStatus();
+  syncProcessingWakeLock();
+}
+
+// Keep progress visible on a phone. The server continues if the tab sleeps.
+let processingLock = null;
+async function syncProcessingWakeLock() {
+  if (!navigator.wakeLock) return;
+  if (activeUploads > 0 && !processingLock && !document.hidden) {
+    try {
+      const lock = await navigator.wakeLock.request("screen");
+      lock.addEventListener("release", () => { if (processingLock === lock) processingLock = null; });
+      if (activeUploads > 0 && !processingLock) processingLock = lock;
+      else lock.release().catch(() => {});
+    } catch (error) { /* refused (low battery, no permission): processing still works */ }
+  } else if (activeUploads === 0 && processingLock) {
+    const lock = processingLock;
+    processingLock = null;
+    lock.release().catch(() => {});
+  }
 }
 
 async function processUpload(job) {
   try {
-    const formData = new FormData();
-    formData.append("file", job.file);
-    const res = await fetch("/api/upload", { method: "POST", body: formData });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || `Eroare server (${res.status})`);
+    if (!job.jobId || job.submitAgain) {
+      job.jobId ||= Array.from(crypto.getRandomValues(new Uint8Array(16)), (n) => n.toString(16).padStart(2, "0")).join("");
+      persistPendingJobs();
+      const formData = new FormData();
+      formData.append("file", job.file);
+      formData.append("request_id", job.jobId);
+      try {
+        const accepted = await requestJson("/api/jobs", { method: "POST", body: formData });
+        job.jobId = accepted.job_id;
+        job.submitAgain = false;
+      } catch (error) {
+        // Retrying a lost acknowledgement uses the same id, never a second job.
+        job.submitAgain = true;
+        if (error.status && error.status < 500 && error.status !== 409) job.jobId = null;
+        throw error;
+      }
+      persistPendingJobs();
     }
-    const data = await res.json();
+    const data = await waitForDocument(job);
     readyDocument(job, data);
     if (!currentSessionId && !openingDocument) applySessionData(data);
   } catch (err) {
     job.state = "failed";
-    job.statusText = `Eroare: ${err.message}`;
-    job.buttonText = "Reîncearcă";
+    // fetch() rejects with a TypeError when the connection drops (phone asleep, signal lost).
+    job.statusText = err instanceof TypeError ?
+      "Conexiunea s-a întrerupt. Verifică rețeaua și apasă Reîncearcă." : `Eroare: ${err.message}`;
+    job.buttonText = !job.file && !job.jobId ? "Alege din nou fișierul" : "Reîncearcă";
     job.disabled = false;
     syncRecentDocument(job);
+    persistPendingJobs();
   } finally {
     activeUploads -= 1;
     pumpUploads();
   }
+}
+
+async function pollJson(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try { return await requestJson(url, { cache: "no-store", signal: controller.signal }); }
+  finally { clearTimeout(timer); }
+}
+
+async function waitForDocument(job) {
+  let failures = 0;
+  while (!job.removed) {
+    let state;
+    try {
+      state = await pollJson(`/api/jobs/${encodeURIComponent(job.jobId)}`);
+      failures = 0;
+      if (state.status === "ready") {
+        return await pollJson(`/api/session/${encodeURIComponent(state.session_id)}`);
+      }
+    } catch (error) {
+      if (error.status && error.status < 500 && error.status !== 429) {
+        if (error.status === 404) job.jobId = null;
+        throw error;
+      }
+      failures += 1;
+      job.statusText = "Conexiunea s-a întrerupt. Verificarea se reia automat...";
+      syncRecentDocument(job);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(1000 * 2 ** failures, 10000)));
+      continue;
+    }
+    if (state.status === "failed") {
+      job.jobId = null;
+      throw new Error(state.error || "Generarea audio a eșuat.");
+    }
+    const labels = { queued: "În așteptare pe server", extracting: "Se extrage textul...",
+      preparing: "Se pregătește vocea...", exporting: "Se pregătește MP3-ul..." };
+    job.statusText = state.stage === "synthesizing" ?
+      `Se generează audio: ${state.completed_sentences} / ${state.total_sentences} propoziții` :
+      labels[state.stage] || "Se procesează...";
+    syncRecentDocument(job);
+    await new Promise((resolve) => setTimeout(resolve, document.hidden ? 5000 : 1000));
+  }
+}
+
+function restorePendingJobs() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PENDING_JOBS_KEY) || "[]");
+    if (!Array.isArray(saved)) return;
+    const seen = new Set();
+    saved.forEach((item) => {
+      if (!item || !/^[0-9a-f]{32}$/.test(item.jobId) || typeof item.name !== "string" || seen.has(item.jobId)) return;
+      seen.add(item.jobId);
+      const job = addDocument(item.name);
+      job.isUpload = true;
+      job.jobId = item.jobId;
+      addRecentDocument(job);
+      uploadQueue.push(job);
+    });
+    pumpUploads();
+  } catch (error) { /* Storage is unavailable or corrupted. */ }
 }
 
 function openPasteBox(text) {
@@ -338,9 +457,12 @@ pasteSubmit.addEventListener("click", () => {
 
 // Only the person who just generated a document may share it or take its MP3.
 function applySessionData(data, shared = false) {
+  closeRemark();
+  pendingFileTarget = null;
   selectionVersion += 1;
   stopPlayback();
   currentSessionId = data.session_id;
+  currentDocumentName = data.filename || documents.find((job) => job.sessionId === data.session_id)?.name || "";
   documents.forEach(syncRecentDocument);
   playerSection.hidden = false;
 
@@ -351,22 +473,53 @@ function applySessionData(data, shared = false) {
   ownerActions.hidden = shared;
   downloadLink.hidden = !data.mp3_url;
   if (data.mp3_url) downloadLink.href = data.mp3_url;
+  // On a phone the upload card fills the screen; bring the text itself into view.
+  playerSection.scrollIntoView({ block: "start", behavior: "auto" });
 
   const url = new URL(window.location.href);
   url.searchParams.set("s", currentSessionId);
   window.history.replaceState({}, "", url);
 }
 
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (error) {
+    // Plain http (no clipboard API) or a blocked permission: use the legacy path.
+    const field = document.createElement("textarea");
+    field.value = text;
+    field.setAttribute("readonly", "");
+    field.style.cssText = "position:fixed;top:0;left:0;opacity:0;font-size:16px";
+    document.body.appendChild(field);
+    field.select();
+    field.setSelectionRange(0, text.length);
+    let copied = false;
+    try { copied = document.execCommand("copy"); } catch (copyError) { /* fall through */ }
+    field.remove();
+    return copied;
+  }
+}
+
 shareBtn.addEventListener("click", async () => {
   if (!currentSessionId) return;
-  try {
-    await navigator.clipboard.writeText(window.location.href);
+  const url = window.location.href;
+  // The share sheet (WhatsApp, Messages, …) is what people expect on a phone.
+  if (navigator.share && window.matchMedia("(pointer: coarse)").matches) {
+    try {
+      await navigator.share({ title: currentDocumentName || "Text în voce", text: "Ascultă acest document", url });
+      return;
+    } catch (error) {
+      if (error.name === "AbortError") return;     // the person closed the sheet
+    }
+  }
+  if (await copyText(url)) {
     const original = shareBtn.textContent;
     shareBtn.textContent = "✅ Link copiat!";
     setTimeout(() => {
       shareBtn.textContent = original;
     }, 1800);
-  } catch (err) {
+  } else {
     statusEl.textContent = "Nu s-a putut copia linkul automat — copiază-l manual din bara de adresă.";
   }
 });
@@ -484,8 +637,10 @@ function showPage(page, stop = true) {
   pageInput.value = page;
   pageInput.max = readerPages.length;
   pageCountEl.textContent = `/ ${readerPages.length}`;
-  prevPageBtn.disabled = page === 1;
-  nextPageBtn.disabled = page === readerPages.length;
+  prevPageBtn.disabled = endPrevBtn.disabled = page === 1;
+  nextPageBtn.disabled = endNextBtn.disabled = page === readerPages.length;
+  pageEndNav.hidden = readerPages.length < 2;
+  updateMediaSession();
   if (!playing) playBtn.disabled = !sentenceElements.size;
   updateRemarkTarget();
   const url = new URL(window.location.href);
@@ -494,12 +649,25 @@ function showPage(page, stop = true) {
   window.history.replaceState({}, "", url);
 }
 
-prevPageBtn.addEventListener("click", () => showPage(currentPage - 1));
-nextPageBtn.addEventListener("click", () => showPage(currentPage + 1));
+function scrollBehavior() {
+  return reducedMotion.matches ? "auto" : "smooth";
+}
+
+// A manual page change starts at the top of the new page, where the controls are.
+function goToPage(page) {
+  const before = currentPage;
+  showPage(page);
+  if (currentPage !== before) document.querySelector(".top-row").scrollIntoView({ block: "start", behavior: "auto" });
+}
+
+prevPageBtn.addEventListener("click", () => goToPage(currentPage - 1));
+nextPageBtn.addEventListener("click", () => goToPage(currentPage + 1));
+endPrevBtn.addEventListener("click", () => goToPage(currentPage - 1));
+endNextBtn.addEventListener("click", () => goToPage(currentPage + 1));
 pageForm.addEventListener("submit", (event) => {
   event.preventDefault();
   pageInput.blur();
-  showPage(Number(pageInput.value));
+  goToPage(Number(pageInput.value));
 });
 
 // Dark highlight colours from the source document need light text.
@@ -572,16 +740,34 @@ function playSentence(index, startFraction = 0) {
   if (sentenceEl) {
     activeSentenceEl = sentenceEl;
     sentenceEl.classList.add("active");
-    sentenceEl.scrollIntoView({ behavior: "smooth", block: "center" });
+    sentenceEl.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
   }
 
   audio.src = sentence.audio_url;
-  audio.playbackRate = playbackRate;
+  audio.defaultPlaybackRate = audio.playbackRate = playbackRate;
 
   audio.onloadedmetadata = startFraction > 0
     ? () => { audio.currentTime = startFraction * audio.duration; }
     : null;
   startAudio();
+  updateMediaSession();
+  prefetchSentence(index + 1);
+}
+
+// Fetch the next sentence while the current one plays, so a slow mobile
+// connection does not leave a gap between sentences. A second element only
+// ever preloads; playback stays on `audio`, which keeps lock-screen audio alive.
+let preloadAudio = null;
+let preloadedUrl = "";
+function prefetchSentence(index) {
+  const next = sentences[index];
+  if (!next || next.audio_url === preloadedUrl || navigator.connection?.saveData) return;
+  if (!preloadAudio) {
+    preloadAudio = new Audio();
+    preloadAudio.preload = "auto";
+  }
+  preloadedUrl = next.audio_url;
+  preloadAudio.src = next.audio_url;
 }
 
 function seekTo(index, startFraction = 0) {
@@ -634,12 +820,23 @@ audio.addEventListener("ended", () => {
   if (currentIndex >= 0) playSentence(currentIndex + 1);
 });
 
+// Slow or lost connection: show it instead of looking frozen.
+audio.addEventListener("waiting", () => { if (playing) playBtn.classList.add("buffering"); });
+audio.addEventListener("playing", () => playBtn.classList.remove("buffering"));
+audio.addEventListener("error", () => {
+  if (currentIndex < 0 || !playing) return;
+  statusEl.textContent = "Conexiune slabă: propoziția nu s-a încărcat. Apasă Play pentru a reîncerca.";
+  setPlaying(false);
+});
+
 // One button plays and pauses; the label always shows what a tap will do.
 function setPlaying(on) {
   playing = on;
   playBtn.textContent = on ? "⏸" : "▶";
   playBtn.setAttribute("aria-label", on ? "Pauză" : "Redare");
   playBtn.disabled = !on && !sentenceElements.size;
+  if (!on) playBtn.classList.remove("buffering");
+  if (mediaSession) mediaSession.playbackState = on ? "playing" : "paused";
 }
 
 function startAudio() {
@@ -654,13 +851,57 @@ function startAudio() {
   });
 }
 
-playBtn.addEventListener("click", () => {
+function togglePlayback() {
   if (playing) pausePlayback();
   else if (currentIndex === -1) {
     const firstIndex = readerPages[currentPage - 1]?.[0]?.sentence_indices[0];
     if (firstIndex !== undefined) playSentence(firstIndex);
-  } else startAudio();
-});
+  } else if (audio.error) playSentence(currentIndex);   // reload after a dropped connection
+  else startAudio();
+}
+
+playBtn.addEventListener("click", togglePlayback);
+
+// ---- Lock screen, notification shade and headset buttons ----
+function updateMediaSession() {
+  if (!mediaSession || typeof MediaMetadata === "undefined" || !currentSessionId) return;
+  mediaSession.metadata = new MediaMetadata({
+    title: currentDocumentName || "Text în voce",
+    artist: readerPages.length > 1 ? `Pagina ${currentPage} din ${readerPages.length}` : "Text în voce",
+    album: "Text în voce",
+    artwork: [
+      { src: "/icons/icon-192.png", sizes: "192x192", type: "image/png" },
+      { src: "/icons/icon-512.png", sizes: "512x512", type: "image/png" },
+    ],
+  });
+}
+
+function skipSentence(delta) {
+  // Like a music player: "previous" first restarts a sentence that is already under way.
+  if (delta < 0 && currentIndex >= 0 && audio.currentTime > 2) {
+    audio.currentTime = 0;
+    return;
+  }
+  const from = currentIndex >= 0 ? currentIndex : remarkTargetIndex();
+  if (from === undefined) return;
+  const target = from + delta;
+  if (target >= 0 && target < sentences.length) playSentence(target);
+}
+
+if (mediaSession) {
+  const handlers = {
+    play: () => { if (!playing) togglePlayback(); },
+    pause: () => { if (playing) pausePlayback(); },
+    stop: () => stopPlayback(),
+    previoustrack: () => skipSentence(-1),
+    nexttrack: () => skipSentence(1),
+    seekbackward: () => skipSentence(-1),
+    seekforward: () => skipSentence(1),
+  };
+  Object.entries(handlers).forEach(([action, handler]) => {
+    try { mediaSession.setActionHandler(action, handler); } catch (error) { /* action not supported here */ }
+  });
+}
 
 function pausePlayback() {
   playbackRequest += 1;
@@ -681,7 +922,7 @@ function stopPlayback() {
 speedBtn.addEventListener("click", () => {
   playbackRate = SPEEDS[(SPEEDS.indexOf(playbackRate) + 1) % SPEEDS.length];
   speedBtn.textContent = `${playbackRate}x`;
-  audio.playbackRate = playbackRate;
+  audio.defaultPlaybackRate = audio.playbackRate = playbackRate;
 });
 
 // ---- Audio remarks: record a voice note on the paragraph where playback stopped ----
@@ -713,6 +954,7 @@ let recording = null;                  // { target, recorder, stream, chunks, st
 let draft = null;                      // { target, blob, seconds } waiting to be saved
 let remarkBusy = false;
 let pendingFileTarget = null;          // paragraph awaiting a file from the phone's own recorder
+let sheetHistory = false;              // a history entry stands for the open sheet
 
 function formatSeconds(seconds) {
   const whole = Math.max(0, Math.round(seconds));
@@ -840,6 +1082,7 @@ function toggleRemark(remark) {
   remarkAudio.playbackRate = 1;
   playingRemark = remark.id;
   remarkAudio.play().catch(() => {
+    if (playingRemark !== remark.id) return;
     stopRemarkPlayback();
     statusEl.textContent = "Nu s-a putut reda remarca audio.";
   });
@@ -857,14 +1100,36 @@ async function deleteRemark(remark) {
   loadRemarks();
 }
 
-function showRemarkStage(stage) {
+// On a phone the Back gesture would leave the page and throw the recording away.
+// While the sheet is open it owns one history entry, so Back just closes it.
+function showRemarkStage(stage, keepHistory = false) {
   remarkSheet.hidden = stage === null;
   remarkRecordingStage.hidden = stage !== "recording";
   remarkReviewStage.hidden = stage !== "review";
   document.body.classList.toggle("sheet-open", stage !== null);
   if (stage === "recording") remarkStopBtn.focus();
   if (stage === "review") remarkSaveBtn.focus();
+  if (stage !== null && !sheetHistory) {
+    window.history.pushState({ remarkSheet: true }, "");
+    sheetHistory = true;
+  } else if (stage === null && sheetHistory && !keepHistory) {
+    sheetHistory = false;
+    window.history.back();
+  }
 }
+
+// The sheet never opened (microphone refused after a redo): give the entry back.
+function releaseSheetHistory() {
+  if (!sheetHistory || !remarkSheet.hidden) return;
+  sheetHistory = false;
+  window.history.back();
+}
+
+window.addEventListener("popstate", () => {
+  if (!sheetHistory) return;
+  sheetHistory = false;                 // the browser already removed the entry
+  closeRemark();
+});
 
 function remarkError(message) {
   remarkErrorEl.textContent = message;
@@ -884,20 +1149,28 @@ async function startRemark(target) {
   // Without a secure context the browser hides the microphone API; phones can
   // still record through their own audio app via a capture file input.
   if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-    pendingFileTarget = target;
+    pendingFileTarget = { target, sessionId: currentSessionId };
     remarkFileInput.value = "";
+    releaseSheetHistory();
     remarkFileInput.click();
     return;
   }
   remarkBusy = true;
   updateRemarkTarget();
+  const sessionId = currentSessionId;
+  const version = remarksVersion;
+  let stream;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
+    if (sessionId !== currentSessionId || version !== remarksVersion) {
+      stream.getTracks().forEach((track) => track.stop());
+      return;
+    }
     const type = pickRecorderType();
     const recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
-    const state = { target, recorder, stream, chunks: [], started: Date.now(), timer: null, wakeLock: null, cancelled: false };
+    const state = { target, sessionId, recorder, stream, chunks: [], started: Date.now(), timer: null, wakeLock: null, cancelled: false };
     recorder.addEventListener("dataavailable", (event) => { if (event.data.size) state.chunks.push(event.data); });
     recorder.addEventListener("stop", () => finishRecording(state));
     recorder.start(1000);
@@ -908,12 +1181,18 @@ async function startRemark(target) {
       remarkTimerEl.textContent = formatSeconds(seconds);
       if (seconds >= MAX_REMARK_SECONDS) stopRecording();
     }, 250);
-    navigator.wakeLock?.request("screen").then((lock) => { state.wakeLock = lock; }).catch(() => {});
+    navigator.wakeLock?.request("screen").then((lock) => {
+      if (recording === state && !state.cancelled) state.wakeLock = lock;
+      else lock.release().catch(() => {});
+    }).catch(() => {});
     navigator.vibrate?.(30);
     showRemarkStage("recording");
   } catch (error) {
+    stream?.getTracks().forEach((track) => track.stop());
+    if (sessionId !== currentSessionId || version !== remarksVersion) return;
     remarkBusy = false;
     updateRemarkTarget();
+    releaseSheetHistory();
     statusEl.textContent = error.name === "NotAllowedError" || error.name === "SecurityError" ?
       "Microfonul este blocat. Permite accesul la microfon în setările browserului și încearcă din nou." :
       error.name === "NotFoundError" ? "Nu s-a găsit niciun microfon pe acest dispozitiv." :
@@ -945,10 +1224,11 @@ function finishRecording(state) {
     return;
   }
   navigator.vibrate?.(20);
-  reviewDraft({ target: state.target, blob, seconds });
+  reviewDraft({ target: state.target, sessionId: state.sessionId, blob, seconds });
 }
 
 function reviewDraft(next) {
+  if (next.sessionId !== currentSessionId) return;
   draft = next;
   remarkBusy = true;
   if (remarkPreview.src) URL.revokeObjectURL(remarkPreview.src);
@@ -957,7 +1237,7 @@ function reviewDraft(next) {
   showRemarkStage("review");
 }
 
-function closeRemark() {
+function closeRemark(keepHistory = false) {
   if (recording) {
     recording.cancelled = true;
     if (recording.recorder.state === "recording") recording.recorder.stop();
@@ -969,22 +1249,23 @@ function closeRemark() {
   remarkPreview.pause();
   if (remarkPreview.src) URL.revokeObjectURL(remarkPreview.src);
   remarkPreview.removeAttribute("src");
-  showRemarkStage(null);
+  showRemarkStage(null, keepHistory);
   updateRemarkTarget();
 }
 
 remarkFileInput.addEventListener("change", () => {
   const file = remarkFileInput.files[0];
-  const target = pendingFileTarget;
+  const pending = pendingFileTarget;
   pendingFileTarget = null;
-  if (file && target !== null) reviewDraft({ target, blob: file, seconds: null });
+  if (file && pending) reviewDraft({ ...pending, blob: file, seconds: null });
 });
 remarkStopBtn.addEventListener("click", stopRecording);
-remarkCancelBtn.addEventListener("click", closeRemark);
+remarkCancelBtn.addEventListener("click", () => closeRemark());
 remarkRedoBtn.addEventListener("click", () => {
   const target = draft?.target;
-  closeRemark();
+  closeRemark(true);                    // keeps the history entry: the sheet reopens at once
   if (target !== undefined) startRemark(target);
+  else releaseSheetHistory();
 });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !remarkSheet.hidden) closeRemark();
@@ -992,7 +1273,8 @@ document.addEventListener("keydown", (event) => {
 
 remarkSaveBtn.addEventListener("click", async () => {
   if (!draft || remarkSaveBtn.disabled) return;
-  const sessionId = currentSessionId;
+  const savingDraft = draft;
+  const sessionId = savingDraft.sessionId;
   const author = remarkAuthor.value.trim();
   const extension = (draft.blob.type.split(";")[0].split("/")[1] || "webm").replace("x-", "");
   const form = new FormData();
@@ -1006,21 +1288,26 @@ remarkSaveBtn.addEventListener("click", async () => {
   try {
     await requestJson(`/api/session/${encodeURIComponent(sessionId)}/remarks`, { method: "POST", body: form });
     try { localStorage.setItem(AUTHOR_KEY, author); } catch (error) { /* storage blocked */ }
-    const target = draft.target;
+    if (draft !== savingDraft || sessionId !== currentSessionId) return;
+    const target = savingDraft.target;
     closeRemark();
     statusEl.textContent = "Remarca a fost salvată.";
     await loadRemarks();
     paragraphEls.get(target)?.row.scrollIntoView({ block: "nearest", behavior: "smooth" });
   } catch (error) {
     // Keep the recording so a network hiccup does not lose it.
-    remarkError(`Remarca nu a fost salvată: ${error.message}`);
+    if (draft === savingDraft) remarkError(`Remarca nu a fost salvată: ${error.message}`);
   } finally {
     remarkSaveBtn.disabled = remarkRedoBtn.disabled = false;
     remarkSaveBtn.textContent = "Salvează remarca";
   }
 });
 
+restorePendingJobs();
+
 // Other visitors may have added remarks while this tab was in the background.
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && currentSessionId && !remarkBusy) loadRemarks();
+  if (document.hidden) return;
+  syncProcessingWakeLock();             // wake locks are released whenever the page is hidden
+  if (currentSessionId && !remarkBusy) loadRemarks();
 });

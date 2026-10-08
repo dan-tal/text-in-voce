@@ -2,10 +2,19 @@
 <html lang="ro">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="theme-color" content="#2a6df4">
 <meta name="color-scheme" content="light">
+<!-- iOS would turn digits in the document into phone links and swallow taps meant to seek. -->
+<meta name="format-detection" content="telephone=no, date=no, address=no, email=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Text în voce">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <title>Text în voce</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -17,12 +26,12 @@
   <main>
     <section id="upload-section" class="card">
       <form id="upload-form">
-        <input type="file" id="file-input" accept=".docx,.pdf,.txt" multiple required aria-label="Documente de procesat">
+        <input type="file" id="file-input" accept=".docx,.pdf,.txt,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document" multiple required aria-label="Documente de procesat">
         <button type="submit" id="upload-btn">Încarcă și generează audio</button>
       </form>
       <div class="paste-row">
         <button type="button" id="paste-btn" class="secondary-btn">📋 Lipește text din clipboard</button>
-        <span class="hint-inline">sau apasă Ctrl+V oriunde în pagină</span>
+        <span class="hint-inline desktop-only">sau apasă Ctrl+V oriunde în pagină</span>
       </div>
       <div id="paste-box" hidden>
         <textarea id="paste-text" rows="8" placeholder="Lipește sau scrie textul aici..."></textarea>
@@ -52,6 +61,10 @@
       </div>
       <p class="hint">Apasă pe o propoziție pentru a sări acolo. Oprește la un paragraf și apasă 🎙 pentru o remarcă vocală.</p>
       <div id="text-container"></div>
+      <nav id="page-end-nav" class="page-end-nav" aria-label="Paginarea la sfârșitul textului" hidden>
+        <button type="button" id="end-prev" class="secondary-btn">‹ Înapoi</button>
+        <button type="button" id="end-next" class="secondary-btn">Pagina următoare ›</button>
+      </nav>
       <div id="player-bar" class="player-bar">
         <span id="remark-dock-target" class="remark-dock-target"></span>
         <div class="bar-row">
